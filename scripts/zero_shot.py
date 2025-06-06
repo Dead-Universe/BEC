@@ -108,6 +108,7 @@ def zero_shot_learning(args, model_args, results_path: Path):
                 building_dataset, batch_size=args.batch_size, shuffle=False
             )
             for batch in building_dataloader:
+
                 building_types_mask = batch["building_type"][:, 0, 0] == 1
 
                 for k, v in batch.items():
@@ -176,8 +177,8 @@ def zero_shot_learning(args, model_args, results_path: Path):
                     y_distribution_params=distribution_params,
                     centroids=centroids,
                 )
-            if count == 10:
-                break
+            # if count == 10:
+            #     break
     print("Generating summaries...")
     variant_name = f":{args.variant_name}" if args.variant_name != "" else ""
     metrics_file = results_path / f"metrics_{args.model}{variant_name}.csv"
