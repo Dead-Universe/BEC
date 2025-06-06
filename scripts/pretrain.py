@@ -1,5 +1,9 @@
+import datetime
 import torch
 import torch.nn as nn
+import torch.distributed
+import torch.utils.data.distributed
+import torch.amp
 from pathlib import Path
 import transformers
 import argparse
@@ -62,7 +66,6 @@ def validation(
             ),
             scoring_rule=scoring_rule_factory("rps"),
         )
-
     for batch in val_dataloader:
         building_types_mask = batch["building_type"][:, 0, 0] == 1
 
@@ -179,6 +182,7 @@ def main(args, model_args):
         backend=args.dist_backend,
         init_method=args.dist_url,
         world_size=args.world_size,
+        timeout=datetime.timedelta(seconds=3600),
         rank=args.rank,
     )
     if args.rank == 0:
@@ -331,7 +335,10 @@ def main(args, model_args):
 
     # wrap model with DistributedDataParallel
     model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[local_rank], output_device=local_rank
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=True,  # ← 关键开关
     )
 
     print(f"rank {args.rank} wrapped model in DDP", flush=True)
@@ -349,7 +356,7 @@ def main(args, model_args):
     #################### Resume from checkpoint ####################
 
     if args.resume_from_checkpoint != "":
-        model, optimizer, scheduler, step = utils.load_model_checkpoint(
+        model, optimizer, scheduler, step, best_val_loss = utils.load_model_checkpoint(
             checkpoint_dir / args.resume_from_checkpoint,
             model,
             optimizer,
@@ -365,7 +372,7 @@ def main(args, model_args):
                 nn.init.normal_(p, mean=0.0, std=args.init_scale)
 
     #################### Training loop ##############################
-    best_val_loss = 1e9
+    best_val_loss = best_val_loss or 1e9
 
     print(f"rank {args.rank} step {step} train_steps = {train_steps}", flush=True)
 
@@ -411,7 +418,7 @@ def main(args, model_args):
 
         ppl = torch.exp(batch_loss.detach())
 
-        if args.rank == 0 and step % 500 == 0:
+        if args.rank == 0 and step % 50 == 0:
             wandb.log(
                 {
                     "train/loss": batch_loss,
@@ -422,8 +429,18 @@ def main(args, model_args):
                 },
                 step=step,
             )
+            if args.model == "TransformerWithGaussianAndMoEs-M":
+                wandb.log(
+                    {
+                        "train/aux_loss": model.module.encoder.layers[
+                            0
+                        ].moe_ffn.loss_coef
+                    },
+                    step=step,
+                )
 
         if args.rank == 0 and step % 10000 == 0:
+            start_time = timer()
             print(f"started validation at step {step}...")
 
             val_loss, val_ppl, val_metrics = validation(
@@ -435,6 +452,14 @@ def main(args, model_args):
                 transform,
                 inverse_transform,
                 predict,
+            )
+
+            end_time = timer()
+            secs_per_step = end_time - start_time
+            print(
+                f"finished validation at step {step} with loss {val_loss:.5f} "
+                f"and ppl {val_ppl:.5f} in {(secs_per_step/60):.2f} minutes",
+                flush=True,
             )
             # only rank 0 needs to save model
             if val_loss < best_val_loss:
@@ -448,13 +473,23 @@ def main(args, model_args):
                     Path(checkpoint_dir / model_name).unlink()
                 # save best
                 utils.save_model_checkpoint(
-                    model, optimizer, scheduler, step, checkpoint_dir / model_name
+                    model,
+                    optimizer,
+                    scheduler,
+                    step,
+                    best_val_loss,
+                    checkpoint_dir / model_name,
                 )
 
             # we always save the last val model
             last_model_name = checkpoint_name + "_last.pt"
             utils.save_model_checkpoint(
-                model, optimizer, scheduler, step, checkpoint_dir / last_model_name
+                model,
+                optimizer,
+                scheduler,
+                step,
+                best_val_loss,
+                checkpoint_dir / last_model_name,
             )
 
             for building_type in [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]:
@@ -491,7 +526,7 @@ def main(args, model_args):
             )
             print(f"finished validation with loss {val_loss:.5f} at step {step}...")
 
-        if step == train_steps:
+        if step >= train_steps:
             # stop training after this many steps/train_tokens
             break
 
@@ -499,11 +534,16 @@ def main(args, model_args):
     if args.rank == 0:
         last_model_name = checkpoint_name + "_last.pt"
         utils.save_model_checkpoint(
-            model, optimizer, scheduler, step, checkpoint_dir / last_model_name
+            model,
+            optimizer,
+            scheduler,
+            step,
+            best_val_loss,
+            checkpoint_dir / last_model_name,
         )
+        run.finish()
 
     torch.distributed.destroy_process_group()
-    run.finish()
 
 
 if __name__ == "__main__":
