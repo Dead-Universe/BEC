@@ -17,13 +17,14 @@ def set_seed(seed: int = 42) -> None:
     # print(f"Random seed set as {seed}")
 
 
-def save_model_checkpoint(model, optimizer, scheduler, step, path):
+def save_model_checkpoint(model, optimizer, scheduler, step, best_val_loss, path):
     """Save model checkpoint."""
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
+        "best_val_loss": best_val_loss,
     }
     torch.save(checkpoint, path)
     # print(f"Saved model checkpoint to {path}...")
@@ -36,8 +37,9 @@ def load_model_checkpoint(path, model, optimizer, scheduler, local_rank):
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     step = checkpoint["step"]
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
     # print(f"Loaded model checkpoint from {path}")
-    return model, optimizer, scheduler, step
+    return model, optimizer, scheduler, step, best_val_loss
 
 
 def worker_init_fn_eulp(worker_id):
