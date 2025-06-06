@@ -6,50 +6,54 @@ from buildings_bench.evaluation.scoring_rules import ContinuousRankedProbability
 from typing import List
 
 
-metrics_registry = [
-    'rmse',
-    'mae',
-    'nrmse',
-    'nmae',
-    'mbe',
-    'nmbe',
-    'cvrmse'
-]
+metrics_registry = ["rmse", "mae", "nrmse", "nmae", "mbe", "nmbe", "cvrmse"]
 
-scoring_rule_registry = [
-    'rps',
-    'crps'
-]
+scoring_rule_registry = ["rps", "crps"]
 
 
-def metrics_factory(name: str,
-                    types: List[MetricType] = [MetricType.SCALAR]) -> List[Metric]:
+def metrics_factory(
+    name: str, types: List[MetricType] = [MetricType.SCALAR]
+) -> List[Metric]:
     """
     Create a metric from a name.
     By default, will return a scalar metric.
 
     Args:
         name (str): The name of the metric.
-        types (List[MetricTypes]): The types of the metric.         
+        types (List[MetricTypes]): The types of the metric.
     Returns:
-        metrics_list (List[Metric]): A list of metrics. 
+        metrics_list (List[Metric]): A list of metrics.
     """
-    assert name.lower() in metrics_registry, f'Invalid metric name: {name}'
+    assert name.lower() in metrics_registry, f"Invalid metric name: {name}"
 
-    if name.lower() == 'rmse':
-        return [ Metric(f'{name.lower()}', type, squared_error, sqrt=True) for type in types ]
-    elif name.lower() == 'mae':
-        return [ Metric(f'{name.lower()}', type, absolute_error) for type in types ]
-    elif name.lower() == 'nrmse':
-        return [ Metric(f'{name.lower()}', type, squared_error, normalize=True, sqrt=True) for type in types ]
-    elif name.lower() == 'nmae':
-        return [ Metric(f'{name.lower()}', type, absolute_error, normalize=True) for type in types ]
-    elif name.lower() == 'mbe':
-        return [ Metric(f'{name.lower()}', type, bias_error) for type in types ]
-    elif name.lower() == 'nmbe':
-        return [ Metric(f'{name.lower()}', type, bias_error, normalize=True) for type in types ]
-    elif name.lower() == 'cvrmse':
-        return [ Metric(f'{name.lower()}', type, squared_error, normalize=True, sqrt=True) for type in types ]
+    if name.lower() == "rmse":
+        return [
+            Metric(f"{name.lower()}", type, squared_error, sqrt=True) for type in types
+        ]
+    elif name.lower() == "mae":
+        return [Metric(f"{name.lower()}", type, absolute_error) for type in types]
+    elif name.lower() == "nrmse":
+        return [
+            Metric(f"{name.lower()}", type, squared_error, normalize=True, sqrt=True)
+            for type in types
+        ]
+    elif name.lower() == "nmae":
+        return [
+            Metric(f"{name.lower()}", type, absolute_error, normalize=True)
+            for type in types
+        ]
+    elif name.lower() == "mbe":
+        return [Metric(f"{name.lower()}", type, bias_error) for type in types]
+    elif name.lower() == "nmbe":
+        return [
+            Metric(f"{name.lower()}", type, bias_error, normalize=True)
+            for type in types
+        ]
+    elif name.lower() == "cvrmse":
+        return [
+            Metric(f"{name.lower()}", type, squared_error, normalize=True, sqrt=True)
+            for type in types
+        ]
 
 
 def scoring_rule_factory(name: str) -> ScoringRule:
@@ -60,21 +64,23 @@ def scoring_rule_factory(name: str) -> ScoringRule:
     Returns:
         sr (ScoringRule): A scoring rule.
     """
-    assert name.lower() in scoring_rule_registry, f'Invalid scoring rule name: {name}'
-    
-    if name.lower() == 'crps':
+    assert name.lower() in scoring_rule_registry, f"Invalid scoring rule name: {name}"
+
+    if name.lower() == "crps":
         return ContinuousRankedProbabilityScore()
-    elif name.lower() == 'rps':
+    elif name.lower() == "rps":
         return RankedProbabilityScore()
 
 
 def all_metrics_list() -> List[Metric]:
     """Returns all registered metrics.
-    
+
     Returns:
         metrics_list (List[Metric]): A list of metrics.
     """
     metrics_list = []
     for metric in metrics_registry:
-        metrics_list += metrics_factory(metric, types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
+        metrics_list += metrics_factory(
+            metric, types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY]
+        )
     return metrics_list

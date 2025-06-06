@@ -11,21 +11,18 @@ class TestStandardScaler(unittest.TestCase):
     def setUp(self):
 
         self.ss = transforms.StandardScalerTransform()
-        save_dir = os.environ.get('BUILDINGS_BENCH', '')
-        self.ss.load(Path(save_dir) / 'metadata' / 'transforms')
-
+        save_dir = os.environ.get("BUILDINGS_BENCH", "")
+        self.ss.load(Path(save_dir) / "metadata" / "transforms")
 
     def test_load_standard_scaler(self):
 
-    
         self.assertIsNotNone(self.ss.mean_, True)
         self.assertIsNotNone(self.ss.std_, True)
 
-
     def test_standard_scale(self):
-        
+
         x = torch.FloatTensor([[100.234], [0.234], [55.523]])
-    
+
         y = self.ss.transform(x)
         z = self.ss.undo_transform(y)
 
@@ -36,18 +33,16 @@ class TestBoxCox(unittest.TestCase):
     def setUp(self):
 
         self.bc = transforms.BoxCoxTransform()
-        metadata_dir = os.environ.get('BUILDINGS_BENCH', '')
-        self.bc.load(Path(metadata_dir) / 'metadata' / 'transforms')
-
+        metadata_dir = os.environ.get("BUILDINGS_BENCH", "")
+        self.bc.load(Path(metadata_dir) / "metadata" / "transforms")
 
     def test_load_boxcox(self):
         self.assertIsNotNone(self.bc.boxcox.lambdas_, True)
 
-
     def test_boxcox(self):
-            
+
         x = torch.FloatTensor([[100.234], [0.234], [55.523]])
-    
+
         y = self.bc.transform(x)
         z = self.bc.undo_transform(torch.from_numpy(y).float())
 
@@ -78,15 +73,13 @@ class TestTimestampTransform(unittest.TestCase):
         self.tt = transforms.TimestampTransform()
 
     def test_timestamp(self):
-        x = np.array(['2016-01-01 00:00:00', '2016-01-01 01:00:00'])
+        x = np.array(["2016-01-01 00:00:00", "2016-01-01 01:00:00"])
         # convert x to dataframe
-        x = pd.DataFrame(x, columns=['timestamp'])
+        x = pd.DataFrame(x, columns=["timestamp"])
         y = self.tt.transform(x.timestamp)
         z = self.tt.undo_transform(y)
 
-        #print(x,y,z)
-        self.assertEqual(z[0,0], pd.to_datetime(x.timestamp).dt.dayofyear.values[0])
-        self.assertEqual(z[0,1], pd.to_datetime(x.timestamp).dt.dayofweek.values[0])
-        self.assertEqual(z[0,2], pd.to_datetime(x.timestamp).dt.hour.values[0])
-
-
+        # print(x,y,z)
+        self.assertEqual(z[0, 0], pd.to_datetime(x.timestamp).dt.dayofyear.values[0])
+        self.assertEqual(z[0, 1], pd.to_datetime(x.timestamp).dt.dayofweek.values[0])
+        self.assertEqual(z[0, 2], pd.to_datetime(x.timestamp).dt.hour.values[0])

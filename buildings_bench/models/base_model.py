@@ -5,8 +5,10 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
+
 class BaseModel(nn.Module, PyTorchModelHubMixin, metaclass=abc.ABCMeta):
     """Base class for all models."""
+
     def __init__(self, context_len, pred_len, continuous_loads):
         """Init method for BaseModel.
 
@@ -22,8 +24,8 @@ class BaseModel(nn.Module, PyTorchModelHubMixin, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def forward(self, x: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass. 
-        
+        """Forward pass.
+
         Expected keys in x:
 
             - 'load': torch.Tensor of shape (batch_size, seq_len, 1)
@@ -40,12 +42,11 @@ class BaseModel(nn.Module, PyTorchModelHubMixin, metaclass=abc.ABCMeta):
             predictions, distribution parameters (Tuple[torch.Tensor, torch.Tensor]): outputs
         """
         raise NotImplementedError()
-    
 
     @abc.abstractmethod
     def loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """A function for computing the loss.
-        
+
         Args:
             x (torch.Tensor): preds of shape (batch_size, seq_len, 1)
             y (torch.Tensor): targets of shape (batch_size, seq_len, 1)
@@ -54,7 +55,7 @@ class BaseModel(nn.Module, PyTorchModelHubMixin, metaclass=abc.ABCMeta):
         """
         raise NotImplementedError()
 
-    @abc.abstractmethod 
+    @abc.abstractmethod
     def predict(self, x: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """A function for making a forecast on x with the model.
 
@@ -66,11 +67,10 @@ class BaseModel(nn.Module, PyTorchModelHubMixin, metaclass=abc.ABCMeta):
         """
         raise NotImplementedError()
 
-
     @abc.abstractmethod
     def unfreeze_and_get_parameters_for_finetuning(self):
-        """For transfer learning. 
-        
+        """For transfer learning.
+
         - Set requires_grad=True for parameters being fine-tuned (if necessary)
         - Return the parameters that should be fine-tuned.
         """

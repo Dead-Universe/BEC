@@ -1,12 +1,11 @@
-import torch 
-import math 
+import torch
+import math
 from buildings_bench.evaluation.metrics import MetricType
 from buildings_bench.evaluation.metrics import BuildingsBenchMetric
 
 
 class ScoringRule(BuildingsBenchMetric):
-    """An abstract class for all scoring rules.
-    """
+    """An abstract class for all scoring rules."""
 
     def __init__(self, name: str):
         super().__init__(name, MetricType.HOUR_OF_DAY)
@@ -16,12 +15,12 @@ class ScoringRule(BuildingsBenchMetric):
 
     def __call__(self, **kwargs):
         raise NotImplementedError()
-    
+
     def mean(self):
         if self.value is None:
             return
-        value = torch.stack(self.value,0)
-        self.value = torch.mean(value, 0)    
+        value = torch.stack(self.value, 0)
+        self.value = torch.mean(value, 0)
 
 
 class RankedProbabilityScore(ScoringRule):
@@ -29,7 +28,7 @@ class RankedProbabilityScore(ScoringRule):
     for categorical distributions."""
 
     def __init__(self):
-        super().__init__(name='rps')
+        super().__init__(name="rps")
 
     def rps(self, y_true, y_pred_logits, centroids) -> None:
         """A PyTorch method that calculates the ranked probability score metric
@@ -48,8 +47,9 @@ class RankedProbabilityScore(ScoringRule):
             centroids (torch.Tensor): of shape [vocab_size]
         """
         # Convert class labels y_true to one hot vectors [batch_size, seq_len, vocab_size]
-        y_true = torch.nn.functional.one_hot(y_true.squeeze(2).long(),
-                                             num_classes=centroids.shape[0]).to(y_pred_logits.device)
+        y_true = torch.nn.functional.one_hot(
+            y_true.squeeze(2).long(), num_classes=centroids.shape[0]
+        ).to(y_pred_logits.device)
         # Sort the values, logits, and y_true
         centroids, indices = torch.sort(centroids, dim=-1)
         y_pred_logits = y_pred_logits[:, :, indices]
@@ -62,20 +62,23 @@ class RankedProbabilityScore(ScoringRule):
         y_true_cdf = torch.cumsum(y_true, dim=-1)
         # Calculate the difference between the CDF and the true values
         square = torch.square(cdf - y_true_cdf)
-        
+
         # Calculate the widths of the bins:
         # we need to calculate
         # half the distance to the right centroid and left centroid.
         centroid_dist = centroids[1:] - centroids[:-1]
         half_dists = centroid_dist / 2
         widths = torch.unsqueeze(half_dists[1:] + half_dists[:-1], dim=0)
-        widths = torch.cat([
-            centroids[0].view(1, 1) + half_dists[0].view(1, 1),
-            widths,
-            half_dists[-1].view(1, 1)
-        ],dim=1)
-        
-        # Calculate the RPS    
+        widths = torch.cat(
+            [
+                centroids[0].view(1, 1) + half_dists[0].view(1, 1),
+                widths,
+                half_dists[-1].view(1, 1),
+            ],
+            dim=1,
+        )
+
+        # Calculate the RPS
         rps = torch.mean(torch.sum(square * widths, dim=-1), dim=0)  # [seq_len]
         if self.value is None:
             self.value = [rps]
@@ -90,8 +93,9 @@ class ContinuousRankedProbabilityScore(ScoringRule):
     """
     A class that calculates the Gaussian continuous ranked probability score (CRPS) metric.
     """
+
     def __init__(self):
-        super().__init__(name = 'crps')
+        super().__init__(name="crps")
 
     def crps(self, true_continuous, y_pred_distribution_params) -> None:
         """Computes the Gaussian CRPS.
@@ -102,7 +106,7 @@ class ContinuousRankedProbabilityScore(ScoringRule):
         """
         pred_mu = y_pred_distribution_params[:, :, 0].unsqueeze(-1)
         pred_sigma = y_pred_distribution_params[:, :, 1].unsqueeze(-1)
-        
+
         # standardize the true values to N(0,1)
         true_continuous = (true_continuous - pred_mu) / pred_sigma
         # Calculate the cumulative distribution function (CDF) of the predictions
@@ -112,7 +116,7 @@ class ContinuousRankedProbabilityScore(ScoringRule):
         # Calculate pi inv
         pi_inv = 1 / math.sqrt(math.pi)
         # CRPS
-        crps = pred_sigma * ( true_continuous * (2 * cdf - 1) + 2 * pdf - pi_inv)
+        crps = pred_sigma * (true_continuous * (2 * cdf - 1) + 2 * pdf - pi_inv)
         crps = torch.mean(crps, dim=0).squeeze(1)  # [seq_len]
         if self.value is None:
             self.value = [crps]

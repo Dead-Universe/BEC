@@ -1,6 +1,7 @@
 from typing import Callable
-import torch 
+import torch
 import abc
+
 
 class MetricType:
     """Enum class for metric types.
@@ -9,8 +10,9 @@ class MetricType:
         SCALAR (str): A scalar metric.
         HOUR_OF_DAY (str): A metric that is calculated for each hour of the day.
     """
-    SCALAR = 'scalar'
-    HOUR_OF_DAY = 'hour_of_day'
+
+    SCALAR = "scalar"
+    HOUR_OF_DAY = "hour_of_day"
 
 
 class BuildingsBenchMetric(metaclass=abc.ABCMeta):
@@ -28,6 +30,7 @@ class BuildingsBenchMetric(metaclass=abc.ABCMeta):
         type (MetricType): The type of the metric.
         value (float): The value of the metric.
     """
+
     def __init__(self, name: str, type: MetricType):
         self.name = name
         self.type = type
@@ -36,21 +39,21 @@ class BuildingsBenchMetric(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def __call__(self, *args, **kwargs):
         raise NotImplementedError()
-    
+
     @abc.abstractmethod
     def reset(self):
         raise NotImplementedError()
-    
+
     @abc.abstractmethod
     def mean(self):
         raise NotImplementedError()
- 
+
 
 class Metric(BuildingsBenchMetric):
-    """A class that represents an error metric.  
+    """A class that represents an error metric.
 
     Example:
-    
+
     ```python
     rmse = Metric('rmse', MetricType.SCALAR, squared_error, sqrt=True)
     mae = Metric('mae', MetricType.SCALAR, absolute_error)
@@ -59,13 +62,14 @@ class Metric(BuildingsBenchMetric):
     nmbe = Metric('nmbe', MetricType.SCALAR, bias_error, normalize=True)
     ```
     """
+
     def __init__(self, name: str, type: MetricType, function: Callable, **kwargs):
         """
         Args:
             name (str): The name of the metric.
             type (MetricType): The type of the metric.
             function (Callable): A function that takes two tensors and returns a tensor.
-        
+
         Keyword Args:
             normalize (bool): Whether to normalize the error.
             sqrt (bool): Whether to take the square root of the error.
@@ -101,7 +105,7 @@ class Metric(BuildingsBenchMetric):
             # because this metric is unused. -1
             # is a flag to indicate this.
             return
-        
+
         # When we concatenate errors and global values
         # we want shape errors to be shape [batches, pred_len]
         # and global values to be 1D
@@ -109,22 +113,23 @@ class Metric(BuildingsBenchMetric):
             self.errors = [e.unsqueeze(0) for e in self.errors]
         if self.global_values[0].dim() == 0:
             self.global_values = [g.unsqueeze(0) for g in self.global_values]
-    
-        all_errors = torch.concatenate(self.errors,0)
+
+        all_errors = torch.concatenate(self.errors, 0)
         if self.type == MetricType.SCALAR:
             mean = torch.mean(all_errors)
         elif self.type == MetricType.HOUR_OF_DAY:
             mean = torch.mean(all_errors, dim=0)
         # for root mean error
-        if self.kwargs.get('sqrt', False):
+        if self.kwargs.get("sqrt", False):
             mean = torch.sqrt(mean)
         # normalize
-        if self.kwargs.get('normalize', False):
-            mean = mean / torch.mean(torch.concatenate(self.global_values,0))
+        if self.kwargs.get("normalize", False):
+            mean = mean / torch.mean(torch.concatenate(self.global_values, 0))
         self.value = mean
-    
-    
+
+
 ################## METRICS ##################
+
 
 def absolute_error(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """A PyTorch method that calculates the absolute error (AE) metric.
@@ -132,7 +137,7 @@ def absolute_error(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     Args:
         y_true (torch.Tensor): [batch, pred_len]
         y_pred (torch.Tensor): [batch, pred_len]
-    
+
     Returns:
         error (torch.Tensor): [batch, pred_len]
     """
@@ -145,21 +150,21 @@ def squared_error(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     Args:
         y_true (torch.Tensor): [batch, pred_len]
         y_pred (torch.Tensor): [batch, pred_len]
-    
+
     Returns:
         error (torch.Tensor): [batch, pred_len]
     """
     return torch.square(y_true - y_pred)
 
- 
+
 def bias_error(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """A PyTorch method that calculates the bias error (BE) metric.
 
     Args:
         y_true (torch.Tensor): [batch, pred_len]
         y_pred (torch.Tensor): [batch, pred_len]
-    
+
     Returns:
-        error (torch.Tensor): [batch, pred_len]    
+        error (torch.Tensor): [batch, pred_len]
     """
     return y_true - y_pred

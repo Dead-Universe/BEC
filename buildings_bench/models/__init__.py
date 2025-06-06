@@ -11,42 +11,44 @@ from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
 
 
 model_registry = {
-    'TransformerWithTokenizer-L': LoadForecastingTransformer,
-    'TransformerWithTokenizer-M': LoadForecastingTransformer,
-    'TransformerWithTokenizer-S': LoadForecastingTransformer,
-    'TransformerWithTokenizer-L-ignore-spatial': LoadForecastingTransformer,
-    'TransformerWithTokenizer-L-8192': LoadForecastingTransformer,
-    'TransformerWithTokenizer-L-474': LoadForecastingTransformer,
-    'TransformerWithMSE': LoadForecastingTransformer,
-    'TransformerWithGaussian-L': LoadForecastingTransformer,
-    'TransformerWithGaussian-M': LoadForecastingTransformer,
-    'TransformerWithGaussian-S': LoadForecastingTransformer,
-    'TransformerWithGaussian-weather-S': LoadForecastingTransformer,
-    'TransformerWithGaussian-weather-M': LoadForecastingTransformer,
-    'TransformerWithGaussian-weather-L': LoadForecastingTransformer,
-    'TransformerWithGaussian-th-S': LoadForecastingTransformer,
-    'TransformerWithGaussian-th-M': LoadForecastingTransformer,
-    'TransformerWithGaussian-th-L': LoadForecastingTransformer,
-    'TransformerWithGaussian-t-L': LoadForecastingTransformer,
-    'TransformerWithGaussian-t-M': LoadForecastingTransformer,
-    'TransformerWithGaussian-t-S': LoadForecastingTransformer,
-    'AveragePersistence': AveragePersistence,
-    'CopyLastDayPersistence': CopyLastDayPersistence,
-    'CopyLastWeekPersistence': CopyLastWeekPersistence,
-    'LinearRegression': LinearRegression,
-    'DLinearRegression': DLinearRegression,
-    'DeepAutoregressiveRNN': DeepAutoregressiveRNN,
+    "TransformerWithTokenizer-L": LoadForecastingTransformer,
+    "TransformerWithTokenizer-M": LoadForecastingTransformer,
+    "TransformerWithTokenizer-S": LoadForecastingTransformer,
+    "TransformerWithTokenizer-L-ignore-spatial": LoadForecastingTransformer,
+    "TransformerWithTokenizer-L-8192": LoadForecastingTransformer,
+    "TransformerWithTokenizer-L-474": LoadForecastingTransformer,
+    "TransformerWithMSE": LoadForecastingTransformer,
+    "TransformerWithGaussian-L": LoadForecastingTransformer,
+    "TransformerWithGaussian-M": LoadForecastingTransformer,
+    "TransformerWithGaussian-S": LoadForecastingTransformer,
+    "TransformerWithGaussian-weather-S": LoadForecastingTransformer,
+    "TransformerWithGaussian-weather-M": LoadForecastingTransformer,
+    "TransformerWithGaussian-weather-L": LoadForecastingTransformer,
+    "TransformerWithGaussian-th-S": LoadForecastingTransformer,
+    "TransformerWithGaussian-th-M": LoadForecastingTransformer,
+    "TransformerWithGaussian-th-L": LoadForecastingTransformer,
+    "TransformerWithGaussian-t-L": LoadForecastingTransformer,
+    "TransformerWithGaussian-t-M": LoadForecastingTransformer,
+    "TransformerWithGaussian-t-S": LoadForecastingTransformer,
+    "AveragePersistence": AveragePersistence,
+    "CopyLastDayPersistence": CopyLastDayPersistence,
+    "CopyLastWeekPersistence": CopyLastWeekPersistence,
+    "LinearRegression": LinearRegression,
+    "DLinearRegression": DLinearRegression,
+    "DeepAutoregressiveRNN": DeepAutoregressiveRNN,
     # Register your model here
 }
 
 
-def model_factory(model_name: str, model_args: Dict) -> Tuple[torch.nn.Module, Callable, Callable]:
+def model_factory(
+    model_name: str, model_args: Dict
+) -> Tuple[torch.nn.Module, Callable, Callable]:
     """Instantiate and returns a model for the benchmark.
 
     Returns the model itself,
     the loss function to use, and the predict function.
 
-    The predict function should return a tuple of two tensors: 
+    The predict function should return a tuple of two tensors:
     (point predictions, prediction distribution parameters) where
     the distribution parameters may be, e.g., logits, or mean and variance.
 
@@ -54,15 +56,15 @@ def model_factory(model_name: str, model_args: Dict) -> Tuple[torch.nn.Module, C
         model_name (str): Name of the model.
         model_args (Dict): The keyword arguments for the model.
     Returns:
-        model (torch.nn.Module): the instantiated model  
+        model (torch.nn.Module): the instantiated model
         loss (Callable): loss function
         predict (Callable): predict function
     """
-    assert model_name in model_registry.keys(), \
-        f"Model {model_name} not in registry: {model_registry.keys()}"
-    
+    assert (
+        model_name in model_registry.keys()
+    ), f"Model {model_name} not in registry: {model_registry.keys()}"
+
     model = model_registry[model_name](**model_args)
     loss = model.loss
     predict = model.predict
     return model, loss, predict
-
