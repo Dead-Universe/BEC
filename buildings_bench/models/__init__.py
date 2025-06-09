@@ -38,6 +38,7 @@ model_registry = {
     "DeepAutoregressiveRNN": DeepAutoregressiveRNN,
     # Register your model here
     "TransformerWithGaussianAndMoEs-M": LoadForecastingTransformerMoE,
+    "TransformerWithGaussianAndMoEs-L":LoadForecastingTransformerMoE,
 }
 
 
