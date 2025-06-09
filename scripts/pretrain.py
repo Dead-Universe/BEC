@@ -353,6 +353,8 @@ def main(args, model_args):
 
     scaler = torch.amp.GradScaler()
 
+    best_val_loss = float("inf")
+
     #################### Resume from checkpoint ####################
 
     if args.resume_from_checkpoint != "":
@@ -372,7 +374,6 @@ def main(args, model_args):
                 nn.init.normal_(p, mean=0.0, std=args.init_scale)
 
     #################### Training loop ##############################
-    best_val_loss = best_val_loss or 1e9
 
     print(f"rank {args.rank} step {step} train_steps = {train_steps}", flush=True)
 
@@ -429,7 +430,7 @@ def main(args, model_args):
                 },
                 step=step,
             )
-            if args.model == "TransformerWithGaussianAndMoEs-M":
+            if args.model.startswith("TransformerWithGaussianAndMoEs"):
                 wandb.log(
                     {
                         "train/aux_loss": model.module.encoder.layers[
