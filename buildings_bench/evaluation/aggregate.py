@@ -34,6 +34,7 @@ def return_aggregate_median(
     """
 
     result_dict = {}
+    metrics = list(set(metrics))
     aggregate_func = lambda x: np.array([np.median(x.reshape(-1))])
     for building_type in [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]:
         result_dict[building_type] = {}
@@ -80,9 +81,13 @@ def return_aggregate_median(
                 df = df.dropna()
 
                 if metric != "rps" and metric != "crps":
+                    # condition = df["metric"].str.startswith(metric + "_")
+                    # 若需包含无后缀的基础名，改用：
+                    condition = (df["metric"] == metric) | df["metric"].str.startswith(
+                        metric + "_"
+                    )
                     result_dict[building_type][metric][model] = df[
-                        (df["metric"] == metric)
-                        & (df["building_type"] == building_type)
+                        (condition) & (df["building_type"] == building_type)
                     ]["value"].values.reshape(-1, 1)
                 else:
                     result_dict[building_type][metric][model] = df[
