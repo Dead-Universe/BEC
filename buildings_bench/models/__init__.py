@@ -6,7 +6,11 @@ from typing import Callable, Tuple, Dict
 from buildings_bench.models.dlinear_regression import DLinearRegression
 from buildings_bench.models.linear_regression import LinearRegression
 from buildings_bench.models.transformers import LoadForecastingTransformer
-from buildings_bench.models.persistence import *
+from buildings_bench.models.persistence import (
+    AveragePersistence,
+    CopyLastDayPersistence,
+    CopyLastWeekPersistence,
+)
 from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
 from buildings_bench.models.transformer_moes import LoadForecastingTransformerMoE
 
@@ -38,7 +42,7 @@ model_registry = {
     "DeepAutoregressiveRNN": DeepAutoregressiveRNN,
     # Register your model here
     "TransformerWithGaussianAndMoEs-M": LoadForecastingTransformerMoE,
-    "TransformerWithGaussianAndMoEs-L":LoadForecastingTransformerMoE,
+    "TransformerWithGaussianAndMoEs-L": LoadForecastingTransformerMoE,
 }
 
 
