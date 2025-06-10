@@ -1,0 +1,12 @@
+[model]
+# 你原来可能有的模型参数，比如 continuous_loads
+continuous_loads = true
+
+[zero_shot]
+model_name = 'amazon/chronos-t5-large'
+# 滑窗长度
+context_len = 168
+# 预测步长
+forecast_horizon = 24
+
+ignore_scoring_rules = true

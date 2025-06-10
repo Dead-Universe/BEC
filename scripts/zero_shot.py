@@ -1,3 +1,5 @@
+import time
+import numpy as np
 import torch
 from pathlib import Path
 import argparse
@@ -7,7 +9,7 @@ import tomli
 from buildings_bench import load_torch_dataset, benchmark_registry
 from buildings_bench import utils
 from buildings_bench.tokenizer import LoadQuantizer
-from buildings_bench.evaluation.managers import DatasetMetricsManager
+from buildings_bench.evaluation.managers import BuildingTypes, DatasetMetricsManager
 from buildings_bench.evaluation import aggregate
 from buildings_bench.models import model_factory
 from buildings_bench.evaluation import scoring_rule_factory
@@ -15,29 +17,88 @@ from buildings_bench.evaluation import scoring_rule_factory
 SCRIPT_PATH = Path(os.path.realpath(__file__)).parent
 
 
+FM_MODELS = {
+    "timesfm": "timesfm",
+    "MOMENT": "moment",
+    "TimeMoE": "timemoe",
+    "chronos": "chronos",
+}
+
+
 @torch.no_grad()
 def zero_shot_learning(args, model_args, results_path: Path):
     device = args.device
 
-    model, _, predict = model_factory(args.model, model_args)
-    model = model.to(device)
+    is_fm = any(args.model.startswith(p) for p in FM_MODELS)
 
     transform_path = (
         Path(os.environ.get("BUILDINGS_BENCH", "")) / "metadata" / "transforms"
     )
 
-    if not model.continuous_loads:
-        load_transform = LoadQuantizer(
-            with_merge=(not args.tokenizer_without_merge),
-            num_centroids=model.vocab_size,
-            device="cuda:0" if "cuda" in device else "cpu",
-        )
-        load_transform.load(transform_path)
+    context_len = getattr(args, "context_len", 168)  # Default context length is 168
+    forecast_horizon = getattr(args, "forecast_horizon", 24)  # Default horizon is 24
 
-    # Load from ckpts
-    if args.checkpoint != "":
-        model.load_from_checkpoint(args.checkpoint)
-    model.eval()
+    if not is_fm:
+        model, _, predict = model_factory(args.model, model_args)
+        model = model.to(device)
+        kind = None
+
+        if not model.continuous_loads:
+            load_transform = LoadQuantizer(
+                with_merge=(not args.tokenizer_without_merge),
+                num_centroids=model.vocab_size,
+                device="cuda:0" if "cuda" in device else "cpu",
+            )
+            load_transform.load(transform_path)
+
+        # Load from ckpts
+        if args.checkpoint != "":
+            model.load_from_checkpoint(args.checkpoint)
+        model.eval()
+    else:
+
+        freq = getattr(args, "freq", "H")
+        kind = next(v for k, v in FM_MODELS.items() if args.model.startswith(k))
+        if kind == "timesfm":
+            import timesfm
+
+            fm = timesfm.TimesFm(
+                hparams=timesfm.TimesFmHparams(
+                    backend="gpu" if "cuda" in device else "cpu",
+                    # per_core_batch_size=32,
+                    horizon_len=forecast_horizon,
+                    num_layers=50,
+                    use_positional_embedding=False,
+                    # context_len=context_len,
+                ),
+                checkpoint=timesfm.TimesFmCheckpoint(
+                    huggingface_repo_id="google/timesfm-2.0-500m-pytorch"
+                ),
+            )
+        elif kind == "moment":
+            # fm = MOMENTPipeline.from_pretrained(
+            #     args.model,
+            #     model_kwargs={
+            #         "task_name": "forecasting",
+            #         "forecast_horizon": forecast_horizon,
+            #     },
+            # )
+            # fm.init()
+            pass
+        elif kind == "timemoe":
+            # fm = TimeMoEForecaster(model_path=args.model)
+            pass
+        elif kind == "chronos":
+            from chronos import BaseChronosPipeline
+
+            # 从 HuggingFace Hub 下载预训练模型，并根据 device 选择推理设备
+            pipeline = BaseChronosPipeline.from_pretrained(
+                args.model_name,  # e.g. "amazon/chronos-t5-small"
+                device_map="cuda" if "cuda" in device else "cpu",
+                torch_dtype=torch.bfloat16,
+            )
+        else:
+            fm = None
 
     if args.benchmark[0] == "all":
         args.benchmark = benchmark_registry
@@ -49,9 +110,9 @@ def zero_shot_learning(args, model_args, results_path: Path):
 
     if args.ignore_scoring_rules:
         metrics_manager = DatasetMetricsManager()
-    elif model.continuous_loads:
+    elif is_fm or model.continuous_loads:
         metrics_manager = DatasetMetricsManager(
-            scoring_rule=scoring_rule_factory("crps")
+            scoring_rule=scoring_rule_factory("crps") if not is_fm else None
         )
     else:
         metrics_manager = DatasetMetricsManager(
@@ -82,12 +143,14 @@ def zero_shot_learning(args, model_args, results_path: Path):
                 f"day-ahead forecasts {len(building_dataset)}"
             )
 
+            start_time = time.time()
+
             metrics_manager.add_building_to_dataset_if_missing(
                 dataset_name,
                 building_name,
             )
 
-            if not model.continuous_loads:  # Quantized loads
+            if not is_fm and not model.continuous_loads:  # Quantized loads
                 transform = load_transform.transform
                 inverse_transform = load_transform.undo_transform
             elif args.apply_scaler_transform != "":  # Scaling continuous values
@@ -109,76 +172,229 @@ def zero_shot_learning(args, model_args, results_path: Path):
             )
             for batch in building_dataloader:
 
-                building_types_mask = batch["building_type"][:, 0, 0] == 1
+                if kind == "timesfm":
+                    full_len = context_len + forecast_horizon
+                    # A) pull out your 168+24 window
+                    arr = batch["load"][..., 0].cpu().numpy()  # (B, 192)
+                    X_ctx = arr[:, :context_len]  # (B,168)
+                    Y_true = torch.tensor(
+                        arr[:, context_len:full_len],
+                        device=device,
+                    )  # (B,24)
 
-                for k, v in batch.items():
-                    batch[k] = v.to(device)
+                    # B) prepare covariates over [0:168+24)
 
-                continuous_load = batch["load"].clone()
-                continuous_targets = continuous_load[:, model.context_len :]
+                    static_num = {
+                        "latitude": batch["latitude"][:, 0, 0].cpu().numpy().tolist(),
+                        "longitude": batch["longitude"][:, 0, 0].cpu().numpy().tolist(),
+                    }
+                    static_cat = {
+                        "building_type": batch["building_type"][:, 0, 0]
+                        .cpu()
+                        .numpy()
+                        .astype(int)
+                        .tolist(),
+                    }
+                    dynamic_cat = {
+                        "day_of_year": batch["day_of_year"][:, :full_len, 0]
+                        .cpu()
+                        .numpy()
+                        .astype(int)
+                        .tolist(),
+                        "day_of_week": batch["day_of_week"][:, :full_len, 0]
+                        .cpu()
+                        .numpy()
+                        .astype(int)
+                        .tolist(),
+                        "hour_of_day": batch["hour_of_day"][:, :full_len, 0]
+                        .cpu()
+                        .numpy()
+                        .astype(int)
+                        .tolist(),
+                    }
+                    # if you have weather columns, build dynamic_numerical_covariates similarly...
+                    dynamic_num = None  # or a dict of lists of length full_len
 
-                # Transform if needed
-                batch["load"] = transform(batch["load"])
-                # These could be tokens or continuous
-                targets = batch["load"][:, model.context_len :]
+                    # C) Forecast — TimesFM will pad 168→192 in multiples of 32 automatically,
+                    #    no need to compute patch_len or pad yourself.
+                    raw_forecast, _ = fm.forecast_with_covariates(
+                        inputs=X_ctx.tolist(),
+                        dynamic_numerical_covariates=dynamic_num,
+                        dynamic_categorical_covariates=dynamic_cat,
+                        static_numerical_covariates=static_num,
+                        static_categorical_covariates=static_cat,
+                        freq=[0] * X_ctx.shape[0],
+                        # explicitly tell it your window is 168+24,
+                        # but let it pad/truncate internally to the model’s patch multiple.
+                        # forecast_context_len=context_len,
+                        # window_size=full_len,
+                        xreg_mode="xreg + timesfm",
+                        normalize_xreg_target_per_input=True,
+                        ridge=0.0,
+                        force_on_cpu=("cpu" in device),
+                    )
 
-                if args.device == "cuda":
-                    with torch.amp.autocast("cuda"):
-                        predictions, distribution_params = predict(batch)
-                else:
-                    predictions, distribution_params = predict(batch)
+                    # D) take the last 24 steps as your zero-shot prediction
+                    preds_np = (
+                        np.stack(raw_forecast)
+                        if isinstance(raw_forecast, list)
+                        else raw_forecast
+                    )  # (B, 24)
+                    # we know padded_len ≥ 168+24, so slice out the 24 after the first 168:
+                    Y_pred = torch.tensor(preds_np, device=device)
 
-                predictions = inverse_transform(predictions)
+                    # E) send into your metrics_manager
+                    mask = (
+                        batch["building_type"][:, 0, 0] == BuildingTypes.COMMERCIAL_INT
+                    )
+                    metrics_manager(
+                        dataset_name,
+                        building_name,
+                        Y_true,
+                        Y_pred,
+                        mask,
+                        y_categories=None,
+                        y_distribution_params=None,
+                        centroids=None,
+                    )
+                elif kind == "moment":
+                    pass
+                elif kind == "timemoe":
+                    pass
+                elif kind == "chronos":
+                    # A) 从 batch 中取出原始负荷序列 (B, T, 1) → (B, T)
+                    arr = batch["load"][..., 0].cpu().numpy()
 
-                if args.apply_scaler_transform != "":
-                    continuous_targets = inverse_transform(continuous_targets)
-                    # invert for crps
-                    targets = inverse_transform(targets)
-                    if args.apply_scaler_transform == "standard":
-                        mu = inverse_transform(distribution_params[:, :, 0])
-                        sigma = load_transform.undo_transform_std(
-                            distribution_params[:, :, 1]
+                    # 新增：定义子批次大小 (根据内存调整)
+                    sub_batch_size = 48  # 可调参数，建议设为2的幂次
+                    batch_size = arr.shape[0]
+
+                    # 新增：初始化结果容器
+                    all_Y_pred = []
+
+                    # B) 循环处理子批次
+                    for start_idx in range(0, batch_size, sub_batch_size):
+                        end_idx = min(start_idx + sub_batch_size, batch_size)
+                        sub_arr = arr[start_idx:end_idx]
+
+                        # 切分上下文和真实值
+                        X_ctx = sub_arr[:, :context_len]  # (sub_batch, context_len)
+
+                        # C) 组装上下文张量，调用 Chronos 预测分位数
+                        context_tensor = torch.tensor(X_ctx)
+                        _, mean = pipeline.predict_quantiles(
+                            context=context_tensor,
+                            prediction_length=forecast_horizon,
                         )
-                        distribution_params = torch.cat(
-                            [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
-                        )
 
-                    elif args.apply_scaler_transform == "boxcox":
-                        ######## backproject approximate Gaussian in unscaled space ########
-                        mu = inverse_transform(distribution_params[:, :, 0])
-                        muplussigma = inverse_transform(
-                            torch.sum(distribution_params, -1)
-                        )
-                        sigma = muplussigma - mu
-                        muminussigma = inverse_transform(
-                            distribution_params[:, :, 0] - distribution_params[:, :, 1]
-                        )
-                        sigma = (sigma + (mu - muminussigma)) / 2
-                        distribution_params = torch.cat(
-                            [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
-                        )
+                        # D) 获取预测结果
+                        Y_pred = (
+                            mean.clone().detach().to(device)
+                        )  # (sub_batch, horizon)
 
-                if not model.continuous_loads:
-                    centroids = (
-                        load_transform.kmeans.centroids.squeeze()
-                        if args.tokenizer_without_merge
-                        else load_transform.merged_centroids
+                        # 新增：存储子批次结果
+                        all_Y_pred.append(Y_pred)
+
+                    # E) 合并所有子批次结果
+                    Y_pred_full = torch.cat(all_Y_pred, dim=0)
+                    # 一次性获取完整真实值和掩码
+                    Y_true_full = torch.tensor(
+                        arr[:, context_len : context_len + forecast_horizon],
+                        device=device,
+                    )  # (B, horizon)
+                    mask_full = (
+                        batch["building_type"][:, 0, 0] == BuildingTypes.COMMERCIAL_INT
+                    ).to(
+                        device
+                    )  # (B,)
+
+                    # F) 送入 metrics_manager
+                    metrics_manager(
+                        dataset_name,
+                        building_name,
+                        Y_true_full,
+                        Y_pred_full,
+                        mask_full,
+                        y_categories=None,
+                        y_distribution_params=None,
+                        centroids=None,
                     )
                 else:
-                    centroids = None
+                    building_types_mask = (
+                        batch["building_type"][:, 0, 0] == BuildingTypes.COMMERCIAL_INT
+                    )
 
-                metrics_manager(
-                    dataset_name,
-                    building_name,
-                    continuous_targets,
-                    predictions,
-                    building_types_mask,
-                    y_categories=targets,
-                    y_distribution_params=distribution_params,
-                    centroids=centroids,
-                )
+                    for k, v in batch.items():
+                        batch[k] = v.to(device)
+
+                    continuous_load = batch["load"].clone()
+                    continuous_targets = continuous_load[:, model.context_len :]
+
+                    # Transform if needed
+                    batch["load"] = transform(batch["load"])
+                    # These could be tokens or continuous
+                    targets = batch["load"][:, model.context_len :]
+
+                    if args.device == "cuda":
+                        with torch.amp.autocast("cuda"):
+                            predictions, distribution_params = predict(batch)
+                    else:
+                        predictions, distribution_params = predict(batch)
+
+                    predictions = inverse_transform(predictions)
+
+                    if args.apply_scaler_transform != "":
+                        continuous_targets = inverse_transform(continuous_targets)
+                        # invert for crps
+                        targets = inverse_transform(targets)
+                        if args.apply_scaler_transform == "standard":
+                            mu = inverse_transform(distribution_params[:, :, 0])
+                            sigma = load_transform.undo_transform_std(
+                                distribution_params[:, :, 1]
+                            )
+                            distribution_params = torch.cat(
+                                [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
+                            )
+
+                        elif args.apply_scaler_transform == "boxcox":
+                            ######## backproject approximate Gaussian in unscaled space ########
+                            mu = inverse_transform(distribution_params[:, :, 0])
+                            muplussigma = inverse_transform(
+                                torch.sum(distribution_params, -1)
+                            )
+                            sigma = muplussigma - mu
+                            muminussigma = inverse_transform(
+                                distribution_params[:, :, 0]
+                                - distribution_params[:, :, 1]
+                            )
+                            sigma = (sigma + (mu - muminussigma)) / 2
+                            distribution_params = torch.cat(
+                                [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
+                            )
+
+                    if not model.continuous_loads:
+                        centroids = (
+                            load_transform.kmeans.centroids.squeeze()
+                            if args.tokenizer_without_merge
+                            else load_transform.merged_centroids
+                        )
+                    else:
+                        centroids = None
+
+                    metrics_manager(
+                        dataset_name,
+                        building_name,
+                        continuous_targets,
+                        predictions,
+                        building_types_mask,
+                        y_categories=targets,
+                        y_distribution_params=distribution_params,
+                        centroids=centroids,
+                    )
             # if count == 10:
             #     break
+            elapsed_time = time.time() - start_time
+            print(f"Building {building_name} processed in {elapsed_time:.2f} seconds.")
     print("Generating summaries...")
     variant_name = f":{args.variant_name}" if args.variant_name != "" else ""
     metrics_file = results_path / f"metrics_{args.model}{variant_name}.csv"
@@ -186,22 +402,13 @@ def zero_shot_learning(args, model_args, results_path: Path):
 
     if not args.ignore_scoring_rules:
         metrics_df, scoring_rule_df = metrics_manager.summary()
-        if metrics_file.exists():
-            metrics_df.to_csv(metrics_file, mode="a", index=False, header=False)
-        else:
-            metrics_df.to_csv(metrics_file, index=False)
-        if scoring_rule_file.exists():
-            scoring_rule_df.to_csv(
-                scoring_rule_file, mode="a", index=False, header=False
-            )
-        else:
-            scoring_rule_df.to_csv(scoring_rule_file, index=False)
+
+        metrics_df.to_csv(metrics_file, index=False)
+
+        scoring_rule_df.to_csv(scoring_rule_file, index=False)
     else:
         metrics_df = metrics_manager.summary()
-        if metrics_file.exists():
-            metrics_df.to_csv(metrics_file, mode="a", index=False, header=False)
-        else:
-            metrics_df.to_csv(metrics_file, index=False)
+        metrics_df.to_csv(metrics_file, index=False)
 
     # Compute and display aggregate statistics
     with open(
