@@ -260,13 +260,16 @@ class DatasetMetricsManager:
     """
 
     default_metrics = (
-        metrics_factory("cvrmse", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
+        metrics_factory("nrmse", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
+        + metrics_factory("cvrmse", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
         + metrics_factory("nmbe", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
         + metrics_factory("nmae", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
     )
 
     def __init__(
-        self, metrics: List[Metric] = default_metrics, scoring_rule: ScoringRule = None
+        self,
+        metrics: List[Metric] = default_metrics,
+        scoring_rule: ScoringRule | None = None,
     ):
         """
         Args:
