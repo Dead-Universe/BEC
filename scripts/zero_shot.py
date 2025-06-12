@@ -54,10 +54,15 @@ def zero_shot_learning(args, model_args, results_path: Path):
         # Load from ckpts
         if args.checkpoint != "":
             model.load_from_checkpoint(args.checkpoint)
+
+        if device.startswith("cuda") and torch.cuda.device_count() > 1:
+            print(f"Use DataParallel on GPUs: {list(range(torch.cuda.device_count()))}")
+            model = torch.nn.DataParallel(
+                model, device_ids=list(range(torch.cuda.device_count()))
+            )
         model.eval()
     else:
 
-        freq = getattr(args, "freq", "H")
         kind = next(v for k, v in FM_MODELS.items() if args.model.startswith(k))
         if kind == "timesfm":
             import timesfm
@@ -110,7 +115,11 @@ def zero_shot_learning(args, model_args, results_path: Path):
 
     if args.ignore_scoring_rules:
         metrics_manager = DatasetMetricsManager()
-    elif is_fm or model.continuous_loads:
+    elif is_fm or (
+        model.module.continuous_loads
+        if isinstance(model, torch.nn.DataParallel)
+        else model.continuous_loads
+    ):
         metrics_manager = DatasetMetricsManager(
             scoring_rule=scoring_rule_factory("crps") if not is_fm else None
         )
@@ -150,7 +159,11 @@ def zero_shot_learning(args, model_args, results_path: Path):
                 building_name,
             )
 
-            if not is_fm and not model.continuous_loads:  # Quantized loads
+            if not is_fm and not (
+                model.module.continuous_loads
+                if isinstance(model, torch.nn.DataParallel)
+                else model.continuous_loads
+            ):  # Quantized loads
                 transform = load_transform.transform
                 inverse_transform = load_transform.undo_transform
             elif args.apply_scaler_transform != "":  # Scaling continuous values
@@ -328,16 +341,34 @@ def zero_shot_learning(args, model_args, results_path: Path):
                         batch[k] = v.to(device)
 
                     continuous_load = batch["load"].clone()
-                    continuous_targets = continuous_load[:, model.context_len :]
+                    continuous_targets = continuous_load[
+                        :,
+                        (
+                            model.module.context_len
+                            if isinstance(model, torch.nn.DataParallel)
+                            else model.context_len
+                        ) :,
+                    ]
 
                     # Transform if needed
                     batch["load"] = transform(batch["load"])
                     # These could be tokens or continuous
-                    targets = batch["load"][:, model.context_len :]
+                    targets = batch["load"][
+                        :,
+                        (
+                            model.module.context_len
+                            if isinstance(model, torch.nn.DataParallel)
+                            else model.context_len
+                        ) :,
+                    ]
 
                     if args.device == "cuda":
                         with torch.amp.autocast("cuda"):
-                            predictions, distribution_params = predict(batch)
+                            if isinstance(model, torch.nn.DataParallel):
+                                # DataParallel.wrap 之后，真正的子模块在 model.module
+                                predictions, distribution_params = model(batch)
+                            else:
+                                predictions, distribution_params = predict(batch)
                     else:
                         predictions, distribution_params = predict(batch)
 
@@ -372,7 +403,11 @@ def zero_shot_learning(args, model_args, results_path: Path):
                                 [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
                             )
 
-                    if not model.continuous_loads:
+                    if not (
+                        model.module.continuous_loads
+                        if isinstance(model, torch.nn.DataParallel)
+                        else model.continuous_loads
+                    ):
                         centroids = (
                             load_transform.kmeans.centroids.squeeze()
                             if args.tokenizer_without_merge

@@ -24,6 +24,7 @@ train_tokens = 1000000000
 apply_scaler_transform = 'boxcox'
 
 [zero_shot]
+batch_size = 2048
 apply_scaler_transform = 'boxcox'
 
 [transfer_learning]
