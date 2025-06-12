@@ -27,7 +27,7 @@ torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:0 \
     scripts/pretrain.py \
-    --model TransformerWithGaussianAndMoEs-L \
+    --model TransformerWithGaussianAndMoEs-S \
     --disable_slurm \
     --num_workers 16
     # --resume_from_checkpoint TransformerWithGaussian-L_last.pt \

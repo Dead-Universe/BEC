@@ -8,6 +8,7 @@ from pathlib import Path
 import transformers
 import argparse
 import wandb
+import swanlab
 import os
 import tomli
 from timeit import default_timer as timer
@@ -243,6 +244,12 @@ def main(args, model_args):
             )
         else:
             run = wandb.init(project=wandb_project, notes=args.note, config=args)
+            run_swanlab = swanlab.init(
+                project=wandb_project,
+                experiment_name=args.model,
+                tags=[args.model, "pretraining"],
+                config=args,
+            )
 
     global_batch_size = args.world_size * args.batch_size
 
@@ -430,6 +437,16 @@ def main(args, model_args):
                 },
                 step=step,
             )
+            swanlab.log(
+                {
+                    "train/loss": batch_loss.item(),
+                    "train/batch_ppl": ppl.item(),
+                    "train/seen_tokens (M)": seen_tokens / 1000000,
+                    "train/secs_per_step": secs_per_step,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                },
+                step=step,
+            )
             if args.model.startswith("TransformerWithGaussianAndMoEs"):
                 wandb.log(
                     {
@@ -439,8 +456,16 @@ def main(args, model_args):
                     },
                     step=step,
                 )
+                swanlab.log(
+                    {
+                        "train/aux_loss": model.module.encoder.layers[
+                            0
+                        ].moe_ffn.loss_coef
+                    },
+                    step=step,
+                )
 
-        if args.rank == 0 and step % 10000 == 0:
+        if args.rank == 0 and step % 1000 == 0:
             start_time = timer()
             print(f"started validation at step {step}...")
 
@@ -500,10 +525,15 @@ def main(args, model_args):
                             {f"val/{building_type}/{metric_name}": metric_result.value},
                             step=step,
                         )
+                        swanlab.log(
+                            {f"val/{building_type}/{metric_name}": metric_result.value},
+                            step=step,
+                        )
                     else:
+                        multi_hour_value = metric_result.value
                         # Create a wandb.Table for each hour of day metric then plot a line plot
                         table = wandb.Table(columns=["time (hour)", metric_name])
-                        multi_hour_value = metric_result.value
+
                         for row_idx in range(multi_hour_value.shape[0]):
                             table.add_data(row_idx, multi_hour_value[row_idx].item())
                         wandb.log(
@@ -518,7 +548,38 @@ def main(args, model_args):
                             step=step,
                         )
 
+                        hours = list(
+                            range(multi_hour_value.shape[0])
+                        )  # 生成小时序列 [0, 1, ..., N-1]
+                        values = [x.item() for x in multi_hour_value]  # 提取指标值列表
+
+                        from pyecharts import options as opts
+
+                        # 创建 pyecharts 折线图对象
+                        line = swanlab.echarts.Line()
+                        line.add_xaxis(hours)  # X轴：时间（小时）
+                        line.add_yaxis(metric_name, values)  # Y轴：指标值
+
+                        # 设置图表标题和坐标轴标签
+                        line.set_global_opts(
+                            title_opts=opts.TitleOpts(title=f"Time vs {metric_name}"),
+                            xaxis_opts=opts.AxisOpts(name="time (hour)"),
+                            yaxis_opts=opts.AxisOpts(name=metric_name),
+                        )
+
+                        # 记录到 SwanLab（指定分类和步骤）
+                        swanlab.log(
+                            {f"val/{building_type}/{metric_name}": line}, step=step
+                        )
+
             wandb.log(
+                {
+                    "val/loss": val_loss,
+                    "val/ppl": val_ppl,
+                },
+                step=step,
+            )
+            swanlab.log(
                 {
                     "val/loss": val_loss,
                     "val/ppl": val_ppl,
@@ -543,6 +604,7 @@ def main(args, model_args):
             checkpoint_dir / last_model_name,
         )
         run.finish()
+        run_swanlab.finish()
 
     torch.distributed.destroy_process_group()
 
