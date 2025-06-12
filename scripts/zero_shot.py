@@ -20,7 +20,7 @@ SCRIPT_PATH = Path(os.path.realpath(__file__)).parent
 FM_MODELS = {
     "timesfm": "timesfm",
     "MOMENT": "moment",
-    "TimeMoE": "timemoe",
+    "timemoe": "timemoe",
     "chronos": "chronos",
 }
 
@@ -91,8 +91,13 @@ def zero_shot_learning(args, model_args, results_path: Path):
             # fm.init()
             pass
         elif kind == "timemoe":
-            # fm = TimeMoEForecaster(model_path=args.model)
-            pass
+            from transformers import AutoModelForCausalLM
+
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                device_map="cuda" if "cuda" in device else "cpu",
+                trust_remote_code=True,
+            )
         elif kind == "chronos":
             from chronos import BaseChronosPipeline
 
@@ -230,21 +235,26 @@ def zero_shot_learning(args, model_args, results_path: Path):
 
                     # C) Forecast — TimesFM will pad 168→192 in multiples of 32 automatically,
                     #    no need to compute patch_len or pad yourself.
-                    raw_forecast, _ = fm.forecast_with_covariates(
+                    # raw_forecast, _ = fm.forecast_with_covariates(
+                    #     inputs=X_ctx.tolist(),
+                    #     dynamic_numerical_covariates=dynamic_num,
+                    #     dynamic_categorical_covariates=dynamic_cat,
+                    #     static_numerical_covariates=static_num,
+                    #     static_categorical_covariates=static_cat,
+                    #     freq=[0] * X_ctx.shape[0],
+                    #     # explicitly tell it your window is 168+24,
+                    #     # but let it pad/truncate internally to the model’s patch multiple.
+                    #     # forecast_context_len=context_len,
+                    #     # window_size=full_len,
+                    #     xreg_mode="xreg + timesfm",
+                    #     normalize_xreg_target_per_input=True,
+                    #     ridge=0.0,
+                    #     force_on_cpu=("cpu" in device),
+                    # )
+
+                    raw_forecast, _ = fm.forecast(
                         inputs=X_ctx.tolist(),
-                        dynamic_numerical_covariates=dynamic_num,
-                        dynamic_categorical_covariates=dynamic_cat,
-                        static_numerical_covariates=static_num,
-                        static_categorical_covariates=static_cat,
                         freq=[0] * X_ctx.shape[0],
-                        # explicitly tell it your window is 168+24,
-                        # but let it pad/truncate internally to the model’s patch multiple.
-                        # forecast_context_len=context_len,
-                        # window_size=full_len,
-                        xreg_mode="xreg + timesfm",
-                        normalize_xreg_target_per_input=True,
-                        ridge=0.0,
-                        force_on_cpu=("cpu" in device),
                     )
 
                     # D) take the last 24 steps as your zero-shot prediction
@@ -273,6 +283,45 @@ def zero_shot_learning(args, model_args, results_path: Path):
                 elif kind == "moment":
                     pass
                 elif kind == "timemoe":
+                    arr = batch["load"][..., 0].cpu().numpy()
+                    X_ctx = arr[:, :context_len]  # (B,168)
+                    Y_true = torch.tensor(
+                        arr[:, context_len : context_len + forecast_horizon],
+                        device=device,
+                    )  # (B,24)
+                    # X_ctx 转为 tensor
+                    context_tensor = torch.tensor(X_ctx, device=device)
+
+                    # nnormalize context_tensor
+                    mean, std = context_tensor.mean(
+                        dim=-1, keepdim=True
+                    ), context_tensor.std(dim=-1, keepdim=True)
+                    normed_seqs = (context_tensor - mean) / std
+
+                    output = model.generate(
+                        normed_seqs,
+                        max_new_tokens=forecast_horizon,
+                    )  # (B, 192)
+
+                    normed_predictions = output[:, -forecast_horizon:]  # (B, 24)
+                    # 反归一化
+                    predictions = normed_predictions * std + mean
+                    predictions = predictions.to(device)
+                    # 送入 metrics_manager
+                    mask = (
+                        batch["building_type"][:, 0, 0] == BuildingTypes.COMMERCIAL_INT
+                    ).to(device)
+                    metrics_manager(
+                        dataset_name,
+                        building_name,
+                        Y_true,
+                        predictions,
+                        mask,
+                        y_categories=None,
+                        y_distribution_params=None,
+                        centroids=None,
+                    )
+
                     pass
                 elif kind == "chronos":
                     # A) 从 batch 中取出原始负荷序列 (B, T, 1) → (B, T)
