@@ -1,0 +1,30 @@
+[model]
+context_len = 168
+pred_len = 24
+num_encoder_layers = 2
+num_decoder_layers = 2
+nhead = 4
+dim_feedforward = 512
+d_model = 256
+dropout = 0.0
+activation = 'gelu'
+continuous_loads = true
+ignore_spatial = false
+continuous_head = 'gaussian_nll'
+num_experts = 4
+top_k = 2
+aux_loss_weight = 0.01
+
+[pretrain]
+batch_size = 1024
+init_scale = 0.02
+warmup_steps = 625
+lr = 0.00006
+train_tokens = 1000000000
+apply_scaler_transform = 'boxcox'
+
+[zero_shot]
+apply_scaler_transform = 'boxcox'
+
+[transfer_learning]
+apply_scaler_transform = 'boxcox'

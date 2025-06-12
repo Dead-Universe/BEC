@@ -43,6 +43,7 @@ model_registry = {
     # Register your model here
     "TransformerWithGaussianAndMoEs-M": LoadForecastingTransformerMoE,
     "TransformerWithGaussianAndMoEs-L": LoadForecastingTransformerMoE,
+    "TransformerWithGaussianAndMoEs-S": LoadForecastingTransformerMoE,
 }
 
 

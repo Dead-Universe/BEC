@@ -438,8 +438,6 @@ class LoadForecastingTransformerMoE(BaseModel):
                                    [batch_size, pred_len, 1] if continuous_loads and continuous_head == 'mse',
                                    [batch_size, pred_len, 2] if continuous_loads and continuous_head == 'gaussian_nll'.
         """
-        if not self.training:
-            return self.predict(x)
         if self.weather_features:
             time_series_inputs = [
                 self.lat_embedding(x["latitude"]),
