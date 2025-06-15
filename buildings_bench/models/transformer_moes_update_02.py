@@ -5,6 +5,7 @@ import torch
 from typing import Tuple, Dict, List
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
 import numpy as np
 from buildings_bench.models.base_model import BaseModel
 
@@ -103,23 +104,7 @@ class ZeroEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-import torch.distributed as dist
-
-
 class HierDSFeedForward(nn.Module):
-    """
-    改进版两级路由 MoE:
-      1) Group-Gate via Gumbel-Softmax (hard-ST) for top-1 group selection；
-         推理时纯硬路由 (p_group=1)
-      2) Expert-Gate 在每个组内做 softmax for top-k experts，避免全量掩码开销
-      3) Shared & expert FFN paths with dropout & bias
-      4) 学习型 balance biases via buffer (不参与梯度) + clamp 限幅防止溢出
-      5) Persistent frequency buffers + DDP 同步
-      6) LayerNorm on inputs for 稳定性
-      7) 预先合并 expert 权重 & 预计算 group id
-      8) 使用 index_add_ 替换 scatter_add_ 提升性能
-    """
-
     def __init__(
         self,
         model_dim: int,
@@ -136,7 +121,6 @@ class HierDSFeedForward(nn.Module):
         super().__init__()
         assert top_k <= experts_per_gp, "top_k must be ≤ experts_per_gp"
 
-        # —— 基本配置 ——
         self.model_dim = model_dim
         self.hidden_dim = hidden_dim
         self.num_groups = num_groups
@@ -161,15 +145,14 @@ class HierDSFeedForward(nn.Module):
             torch.empty(self.num_experts, model_dim, hidden_dim)
         )
         nn.init.xavier_uniform_(self.expert_out_weight)
-        # 专家输出 bias
         self.expert_out_bias = nn.Parameter(torch.zeros(self.num_experts, model_dim))
 
-        # —— Dropout ——
         self.dropout = nn.Dropout(dropout_rate)
 
         # —— Routing gates ——
         self.group_gate = nn.Linear(model_dim, num_groups, bias=False)
         self.expert_gate = nn.Linear(model_dim, self.num_experts, bias=False)
+
         # balance biases & freq buffers
         self.register_buffer("group_bias", torch.zeros(num_groups))
         self.register_buffer("expert_bias", torch.zeros(self.num_experts))
@@ -182,107 +165,108 @@ class HierDSFeedForward(nn.Module):
         return F.silu(a) * b
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, T, C] → out: [B, T, C]
-        """
         B, T, C = x.shape
         S = B * T
         flat = x.reshape(S, C)
         flat = self.input_norm(flat)
 
-        # —— (0) Shared FFN ——
-        h_shared = self._swiglu(self.shared_in(flat))  # [S, hidden_dim]
+        # (0) Shared FFN
+        h_shared = self._swiglu(self.shared_in(flat))
         h_shared = self.dropout(h_shared)
-        out_shared = self.shared_out(h_shared)  # [S, C]
+        out_shared = self.shared_out(h_shared)
 
-        # —— (1) Group-Gate (top-1) ——
-        g_logits = self.group_gate(flat) + self.group_bias  # [S, G]
+        # (1) Group-Gate
+        g_logits = self.group_gate(flat) + self.group_bias  # (S, G)
         if self.training:
-            g_mask = F.gumbel_softmax(
-                g_logits, tau=self.tau, hard=True, dim=-1
-            )  # [S, G]
-            g_probs = F.softmax(g_logits, dim=-1)
-            p_group = (g_probs * g_mask).sum(dim=-1, keepdim=True)  # [S,1]
+            # Gumbel-Softmax 硬化采样得到 one-hot
+            g_mask = F.gumbel_softmax(g_logits, tau=self.tau, hard=True, dim=-1)
+            # 真正的组概率
+            p_group_all = F.softmax(g_logits, dim=-1)  # (S, G)
+            # 根据采样后选中的组，gather 出单个标量概率
+            g_idx = g_mask.argmax(dim=-1, keepdim=True)  # (S, 1)
+            p_group = p_group_all.gather(1, g_idx)  # (S, 1)
         else:
-            g_idx = g_logits.argmax(dim=-1)
-            g_mask = F.one_hot(g_idx, num_classes=self.num_groups).float()  # [S, G]
-            # 推理时纯硬路由，不做概率缩放
+            g_idx = g_logits.argmax(dim=-1)  # (S,)
+            g_mask = F.one_hot(g_idx, self.num_groups).float()
             p_group = torch.ones((S, 1), device=flat.device)
 
-        group_idx = g_mask.argmax(dim=-1)  # [S]
+        group_idx = g_mask.argmax(dim=-1)  # (S,)
 
-        # —— (2) Expert-Gate within selected group ——
-        # 重塑 logits 为 [S, G, E_per_gp]
+        # (2) Expert-Gate
+        # reshape to (S, G, E_g)
         e_logits = self.expert_gate(flat).view(S, self.num_groups, self.experts_per_gp)
         expert_bias = self.expert_bias.view(self.num_groups, self.experts_per_gp)
-        # 按 token 选出对应组的 logits & bias
+        # select the logits & bias of the chosen group per token
         e_logits_sel = (
             e_logits[torch.arange(S), group_idx] + expert_bias[group_idx]
-        )  # [S, E_per_gp]
-        e_probs_sel = F.softmax(e_logits_sel, dim=-1)  # [S, E_per_gp]
+        )  # (S, E_g)
+        e_probs_sel = F.softmax(e_logits_sel, dim=-1)  # (S, E_g)
 
-        # 合并 group 概率后选 Top-k
-        p_expert_sel = e_probs_sel * p_group  # [S, E_per_gp]
-        topv, topi = p_expert_sel.topk(self.top_k, dim=-1)  # [S, top_k]
+        # 混合权重：组概率 * 组内专家概率
+        p_expert = p_group * e_probs_sel  # (S, E_g)
+        topv, topi = p_expert.topk(self.top_k, dim=-1)  # each (S, K)
+        # 归一化 top-k 权重
+        topv = topv / (topv.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # 展平成 dispatch
+        # 计算 dispatch indices & weights
         tok_idx = (
             torch.arange(S, device=flat.device)
-            .unsqueeze(1)
-            .repeat(1, self.top_k)
-            .view(-1)
+            .unsqueeze(-1)
+            .expand(-1, self.top_k)
+            .reshape(-1)
         )
-        disp_ids = (group_idx.unsqueeze(1) * self.experts_per_gp + topi).view(
-            -1
-        )  # [N_sel]
-        disp_w = topv.view(-1)  # [N_sel]
+        disp_ids = (group_idx.unsqueeze(-1) * self.experts_per_gp + topi).reshape(-1)
+        disp_w = topv.reshape(-1)  # (S*K,)
 
-        # —— (3) Expert FFN & vectorized dispatch ——
-        h_expert = self._swiglu(self.expert_in(flat))  # [S, hidden_dim]
+        # (3) Expert FFN
+        h_expert = self._swiglu(self.expert_in(flat))
         h_expert = self.dropout(h_expert)
-        h_sel = h_expert[tok_idx]  # [N_sel, hidden_dim]
-        W2_sel = self.expert_out_weight[disp_ids]  # [N_sel, C, hidden_dim]
-        exp_out = torch.bmm(W2_sel, h_sel.unsqueeze(-1)).squeeze(-1)  # [N_sel, C]
-        # 加上专家输出 bias
-        b_sel = self.expert_out_bias[disp_ids]  # [N_sel, C]
-        exp_out = (exp_out + b_sel) * disp_w.unsqueeze(1)
+        h_sel = h_expert[tok_idx]  # (S*K, D)
+        W2_sel = self.expert_out_weight[disp_ids]  # (S*K, C, D)
+        b_sel = self.expert_out_bias[disp_ids]  # (S*K, C)
 
-        # 累加路由结果
-        routed_out = torch.zeros_like(out_shared)  # [S, C]
-        routed_out.index_add_(0, tok_idx, exp_out)
+        # 确保梯度流过 expert path
+        exp_out = torch.bmm(W2_sel, h_sel.unsqueeze(-1)).squeeze(-1)  # (S*K, C)
+        weighted_out = exp_out * disp_w.unsqueeze(-1) + b_sel  # (S*K, C)
 
-        # —— (4) 更新 balance biases & freq buffers + DDP 同步 + clamp ——
+        # 聚合回 routed_out
+        routed_out = torch.zeros_like(out_shared)  # (S, C)
+        routed_out.index_add_(0, tok_idx, weighted_out)  # preserve grad
+
+        # (4) 负载均衡统计 & bias 更新
         if self.training:
             with torch.no_grad():
-                g_hist = g_mask.sum(dim=0) / S  # [G]
-                e_hist = torch.bincount(disp_ids, minlength=self.num_experts).float()
-                e_hist = e_hist / e_hist.sum()  # [E]
-                # 更新 biases
-                self.group_bias.add_(
-                    self.gamma_group * (g_hist - 1.0 / self.num_groups)
+                # per-process 统计
+                g_count = g_mask.sum(dim=0)  # (G,)
+                e_flat_idx = disp_ids
+                e_count = torch.bincount(e_flat_idx, minlength=self.num_experts).float()
+                # 全局同步
+                if dist.is_initialized():
+                    buf = torch.cat([g_count, e_count], dim=0).to(flat.device)
+                    dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+                    g_count, e_count = buf.split([self.num_groups, self.num_experts])
+                    world_size = dist.get_world_size()
+                    total_tokens = S * world_size
+                else:
+                    total_tokens = S
+                # 归一化频率
+                g_global = g_count / total_tokens
+                e_global = e_count / (total_tokens * self.top_k)
+
+                # 更新 bias，并 clamp
+                self.group_bias += self.gamma_group * (g_global - 1.0 / self.num_groups)
+                self.expert_bias += self.gamma_expert * (
+                    e_global - 1.0 / self.num_experts
                 )
-                self.expert_bias.add_(
-                    self.gamma_expert * (e_hist - 1.0 / self.num_experts)
-                )
-                # 限幅防止溢出
                 self.group_bias.clamp_(-self.bias_clamp, self.bias_clamp)
                 self.expert_bias.clamp_(-self.bias_clamp, self.bias_clamp)
-                # 更新 freq buffers
-                self.group_freq.copy_(g_hist)
-                self.expert_freq.copy_(e_hist)
-                # DDP 同步
-                if dist.is_initialized():
-                    dist.all_reduce(self.group_bias, op=dist.ReduceOp.SUM)
-                    self.group_bias /= dist.get_world_size()
-                    dist.all_reduce(self.expert_bias, op=dist.ReduceOp.SUM)
-                    self.expert_bias /= dist.get_world_size()
-                    dist.all_reduce(self.group_freq, op=dist.ReduceOp.SUM)
-                    self.group_freq /= dist.get_world_size()
-                    dist.all_reduce(self.expert_freq, op=dist.ReduceOp.SUM)
-                    self.expert_freq /= dist.get_world_size()
 
-        # —— (5) 合并 Shared & Routed 输出 ——
-        out = out_shared + routed_out  # [S, C]
+                # 更新 buffer
+                self.group_freq.copy_(g_global)
+                self.expert_freq.copy_(e_global)
+
+        # (5) 合并输出
+        out = out_shared + routed_out
         return out.view(B, T, C)
 
 
