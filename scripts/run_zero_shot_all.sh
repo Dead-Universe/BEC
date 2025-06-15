@@ -16,13 +16,13 @@ export BUILDINGS_BENCH=/data/lx/buildings-bench/v2.0.0/BuildingsBench
 PYTHON=python
 
 # 3. 配置要使用的 GPU
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0
 
 # 4. 运行 zero-shot 脚本
 $PYTHON scripts/zero_shot.py \
-    --model TransformerWithGaussianAndMoEs-L \
+    --model TransformerWithGaussianAndMoEs-S \
     --benchmark all \
-    --checkpoint checkpoints/TransformerWithGaussianAndMoEs-L_best.pt \
+    --checkpoint checkpoints/TransformerWithGaussianAndMoEs-S_best.pt \
     --apply_scaler_transform boxcox
 
 # $PYTHON scripts/zero_shot.py \
