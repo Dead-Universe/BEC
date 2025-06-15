@@ -243,10 +243,10 @@ def main(args, model_args):
                 config=args,
             )
         else:
-            run = wandb.init(project=wandb_project, notes=args.note, config=args)
+            # run = wandb.init(project=wandb_project, notes=args.note, config=args)
             run_swanlab = swanlab.init(
                 project=wandb_project,
-                experiment_name=args.model,
+                experiment_name="transformer_moes_update_01",
                 tags=[args.model, "pretraining"],
                 config=args,
             )
@@ -427,16 +427,16 @@ def main(args, model_args):
         ppl = torch.exp(batch_loss.detach())
 
         if args.rank == 0 and step % 50 == 0:
-            wandb.log(
-                {
-                    "train/loss": batch_loss,
-                    "train/batch_ppl": ppl,
-                    "train/seen_tokens (M)": seen_tokens / 1000000,
-                    "train/secs_per_step": secs_per_step,
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                },
-                step=step,
-            )
+            # wandb.log(
+            #     {
+            #         "train/loss": batch_loss,
+            #         "train/batch_ppl": ppl,
+            #         "train/seen_tokens (M)": seen_tokens / 1000000,
+            #         "train/secs_per_step": secs_per_step,
+            #         "train/lr": optimizer.param_groups[0]["lr"],
+            #     },
+            #     step=step,
+            # )
             swanlab.log(
                 {
                     "train/loss": batch_loss.item(),
@@ -448,22 +448,37 @@ def main(args, model_args):
                 step=step,
             )
             if args.model.startswith("TransformerWithGaussianAndMoEs"):
-                wandb.log(
-                    {
-                        "train/aux_loss": model.module.encoder.layers[
-                            0
-                        ].moe_ffn.loss_coef
-                    },
-                    step=step,
+                # wandb.log(
+                #     {
+                #         "train/aux_loss": model.module.encoder.layers[
+                #             0
+                #         ].moe_ffn.loss_coef
+                #     },
+                #     step=step,
+                # )
+                # swanlab.log(
+                #     {
+                #         "train/aux_loss": model.module.encoder.layers[
+                #             0
+                #         ].moe_ffn.loss_coef
+                #     },
+                #     step=step,
+                # )
+                router_freq_list = (
+                    model.module.encoder.layers[0]
+                    .moe_ffn.router_freq.detach()
+                    .cpu()
+                    .tolist()
                 )
-                swanlab.log(
-                    {
-                        "train/aux_loss": model.module.encoder.layers[
-                            0
-                        ].moe_ffn.loss_coef
-                    },
-                    step=step,
-                )
+
+                # 构造一个字典，每个 value 都是 float
+                metrics = {
+                    f"train/router_freq_{i}": float(freq)
+                    for i, freq in enumerate(router_freq_list)
+                }
+
+                # 一次性记录所有子指标
+                swanlab.log(metrics, step=step)
 
         if args.rank == 0 and step % 1000 == 0:
             start_time = timer()
@@ -521,10 +536,10 @@ def main(args, model_args):
             for building_type in [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]:
                 for metric_name, metric_result in val_metrics[building_type].items():
                     if metric_result.type == MetricType.SCALAR:
-                        wandb.log(
-                            {f"val/{building_type}/{metric_name}": metric_result.value},
-                            step=step,
-                        )
+                        # wandb.log(
+                        #     {f"val/{building_type}/{metric_name}": metric_result.value},
+                        #     step=step,
+                        # )
                         swanlab.log(
                             {f"val/{building_type}/{metric_name}": metric_result.value},
                             step=step,
@@ -532,21 +547,21 @@ def main(args, model_args):
                     else:
                         multi_hour_value = metric_result.value
                         # Create a wandb.Table for each hour of day metric then plot a line plot
-                        table = wandb.Table(columns=["time (hour)", metric_name])
+                        # table = wandb.Table(columns=["time (hour)", metric_name])
 
-                        for row_idx in range(multi_hour_value.shape[0]):
-                            table.add_data(row_idx, multi_hour_value[row_idx].item())
-                        wandb.log(
-                            {
-                                f"val/{building_type}/{metric_name}": wandb.plot.line(
-                                    table,
-                                    "time (hour)",
-                                    metric_name,
-                                    title=f"Time vs {metric_name}",
-                                )
-                            },
-                            step=step,
-                        )
+                        # for row_idx in range(multi_hour_value.shape[0]):
+                        #     table.add_data(row_idx, multi_hour_value[row_idx].item())
+                        # wandb.log(
+                        #     {
+                        #         f"val/{building_type}/{metric_name}": wandb.plot.line(
+                        #             table,
+                        #             "time (hour)",
+                        #             metric_name,
+                        #             title=f"Time vs {metric_name}",
+                        #         )
+                        #     },
+                        #     step=step,
+                        # )
 
                         hours = list(
                             range(multi_hour_value.shape[0])
@@ -572,13 +587,13 @@ def main(args, model_args):
                             {f"val/{building_type}/{metric_name}": line}, step=step
                         )
 
-            wandb.log(
-                {
-                    "val/loss": val_loss,
-                    "val/ppl": val_ppl,
-                },
-                step=step,
-            )
+            # wandb.log(
+            #     {
+            #         "val/loss": val_loss,
+            #         "val/ppl": val_ppl,
+            #     },
+            #     step=step,
+            # )
             swanlab.log(
                 {
                     "val/loss": val_loss,
@@ -603,7 +618,7 @@ def main(args, model_args):
             best_val_loss,
             checkpoint_dir / last_model_name,
         )
-        run.finish()
+        # run.finish()
         run_swanlab.finish()
 
     torch.distributed.destroy_process_group()

@@ -12,7 +12,9 @@ from buildings_bench.models.persistence import (
     CopyLastWeekPersistence,
 )
 from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
-from buildings_bench.models.transformer_moes import LoadForecastingTransformerMoE
+from buildings_bench.models.transformer_moes_update_01 import (
+    LoadForecastingTransformerMoE,
+)
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
