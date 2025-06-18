@@ -266,7 +266,7 @@ class HierDSFeedForward(nn.Module):
             h = self._swiglu(self.w1_shared(sel_in))
             # 专家的第二层
             exp_out = self.w2_expert[eid](h) * disp_w[m].unsqueeze(1)
-            routed_out.index_add_(0, sel_tok, exp_out)
+            routed_out.index_add_(0, sel_tok, exp_out.to(routed_out.dtype))
 
         # —— (4) 跟踪频率，仅在 training 时累积 EMA，不使用 .data 操作 ——
         if self.training:

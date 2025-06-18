@@ -680,3 +680,11 @@ if __name__ == "__main__":
     # 输出结果
     print("Predictions Shape:", predictions.shape)
     # print("Predictions:", predictions)
+
+    seqlen = 2
+
+    mask = torch.full((seqlen, seqlen), float("-inf"), device=device).triu_(1)
+
+    print("Mask Shape:", mask.shape)
+    print(mask)
+    print(mask.unsqueeze(1))
