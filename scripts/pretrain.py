@@ -246,7 +246,7 @@ def main(args, model_args):
             # run = wandb.init(project=wandb_project, notes=args.note, config=args)
             run_swanlab = swanlab.init(
                 project=wandb_project,
-                experiment_name="transformer_moes_update_01",
+                experiment_name=args.model,
                 tags=[args.model, "pretraining"],
                 config=args,
             )
@@ -464,17 +464,48 @@ def main(args, model_args):
                 #     },
                 #     step=step,
                 # )
-                router_freq_list = (
+                # router_freq_list = (
+                #     model.module.encoder.layers[0]
+                #     .moe_ffn.router_freq.detach()
+                #     .cpu()
+                #     .tolist()
+                # )
+
+                # # 构造一个字典，每个 value 都是 float
+                # metrics = {
+                #     f"train/router_freq_{i}": float(freq)
+                #     for i, freq in enumerate(router_freq_list)
+                # }
+
+                # # 一次性记录所有子指标
+                # swanlab.log(metrics, step=step)
+                group_freq_list = (
                     model.module.encoder.layers[0]
-                    .moe_ffn.router_freq.detach()
+                    .moe_ffn.group_freq.detach()
                     .cpu()
                     .tolist()
                 )
 
                 # 构造一个字典，每个 value 都是 float
                 metrics = {
-                    f"train/router_freq_{i}": float(freq)
-                    for i, freq in enumerate(router_freq_list)
+                    f"train/group_freq_{i}": float(freq)
+                    for i, freq in enumerate(group_freq_list)
+                }
+
+                # 一次性记录所有子指标
+                swanlab.log(metrics, step=step)
+
+                expert_freq_list = (
+                    model.module.encoder.layers[0]
+                    .moe_ffn.expert_freq.detach()
+                    .cpu()
+                    .tolist()
+                )
+
+                # 构造一个字典，每个 value 都是 float
+                metrics = {
+                    f"train/expert_freq_{i}": float(freq)
+                    for i, freq in enumerate(expert_freq_list)
                 }
 
                 # 一次性记录所有子指标
