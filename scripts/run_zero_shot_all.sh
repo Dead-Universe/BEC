@@ -10,7 +10,7 @@
 # conda activate bec
 
 # 1. 设置 BUILDINGS_BENCH 环境变量（指向你本地克隆的仓库根目录）
-export BUILDINGS_BENCH=/data/lx/buildings-bench/v2.0.0/BuildingsBench
+export BUILDINGS_BENCH=/mnt/data/lx/buildings-bench/v2.0.0/BuildingsBench
 
 # 2. 指定 Python 可执行文件（可选，若 you want 用绝对路径）
 PYTHON=python
@@ -20,9 +20,9 @@ export CUDA_VISIBLE_DEVICES=0
 
 # 4. 运行 zero-shot 脚本
 $PYTHON scripts/zero_shot.py \
-    --model TransformerWithGaussianAndMoEs-S \
+    --model TimeSeriesTransformer-S \
     --benchmark all \
-    --checkpoint checkpoints/TransformerWithGaussianAndMoEs-S_best.pt \
+    --checkpoint checkpoints/TimeSeriesTransformer-S_best.pt \
     --apply_scaler_transform boxcox
 
 # $PYTHON scripts/zero_shot.py \
