@@ -1,0 +1,33 @@
+[model]
+context_len = 168
+pred_len = 24
+n_encoder_layers = 2
+n_decoder_layers = 2
+n_dense_layers = 1
+n_heads = 4
+moe_inter_dim = 512
+inter_dim = 512
+d_model = 256
+dropout = 0.0
+continuous_loads = true
+ignore_spatial = false
+continuous_head = 'mse'
+n_activated_experts = 2
+n_expert_groups = 2
+n_limited_groups = 2
+n_routed_experts = 4
+n_shared_experts = 1
+
+[pretrain]
+batch_size = 1024
+init_scale = 0.02
+warmup_steps = 625
+lr = 0.00006
+train_tokens = 1000000000
+apply_scaler_transform = 'boxcox'
+
+[zero_shot]
+apply_scaler_transform = 'boxcox'
+
+[transfer_learning]
+apply_scaler_transform = 'boxcox'
