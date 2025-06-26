@@ -213,7 +213,8 @@ class TorchBuildingDatasetFromParquet:
                 df = df[1:]
 
             # split into multiple dataframes by column, keeping the index
-            dfs = np.split(df, df.shape[1], axis=1)
+            # dfs = np.split(df, df.shape[1], axis=1)
+            dfs = [df[[col]].copy() for col in df.columns]
 
             # for each column in the multi_building_dataset, create a BuildingYearDatasetFromCSV
             for building_dataframe in dfs:
@@ -327,7 +328,8 @@ class TorchBuildingDatasetsFromCSV:
             if len(df.columns) > 1:
                 bldg_names = df.columns
                 # split into multiple dataframes by column, keeping the index
-                dfs = np.split(df, df.shape[1], axis=1)
+                # dfs = np.split(df, df.shape[1], axis=1)
+                dfs = [df[[col]].copy() for col in df.columns]
             else:
                 bldg_names = [name]
                 dfs = [df]
@@ -481,7 +483,8 @@ class PandasBuildingDatasetsFromCSV:
             if len(df.columns) > 1:
                 bldg_names = df.columns
                 # split into multiple dataframes by column, keeping the index
-                bldg_dfs = np.split(df, df.shape[1], axis=1)
+                # bldg_dfs = np.split(df, df.shape[1], axis=1)
+                bldg_dfs = [df[[col]].copy() for col in df.columns]
             else:
                 bldg_names = [name]
                 bldg_dfs = [df]
