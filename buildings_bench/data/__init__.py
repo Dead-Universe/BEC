@@ -25,6 +25,7 @@ dataset_registry = [
     "electricity",
     "smart",
     "lcl",
+    # "university",
 ]
 
 benchmark_registry = [
@@ -39,6 +40,7 @@ benchmark_registry = [
     "electricity",
     "smart",
     "lcl",
+    # "university",
 ]
 
 
