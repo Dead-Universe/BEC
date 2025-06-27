@@ -3,10 +3,10 @@
 # THIS IS AN EXAMPLE SCRIPT. 
 # PLEASE CONFIGURE FOR YOUR SETUP.
 
-export BUILDINGS_BENCH=/data/lx/buildings-bench/v2.0.0/BuildingsBench
+export BUILDINGS_BENCH=/mnt/data/lx/buildings-bench/v2.0.0/BuildingsBench
 export WANDB_ENTITY="jmdyz-"
 export WANDB_PROJECT="train"
-NUM_GPUS=4
+NUM_GPUS=1
 
 # torchrun \
 #     --nnodes=1 \
@@ -27,8 +27,8 @@ torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:0 \
     scripts/pretrain.py \
-    --model TimeSeriesTransformer-S \
+    --model TransformerWithGaussianAndMoEs-S \
     --disable_slurm \
     --num_workers 16
-    # --resume_from_checkpoint TransformerWithGaussian-L_last.pt \
+    # --resume_from_checkpoint TransformerWithGaussianAndMoEs-S_last.pt \
     # --wandb_run_id yz6jcske
