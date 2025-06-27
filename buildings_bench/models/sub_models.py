@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 from typing import Dict, Literal, Optional, Tuple
+import numpy as np
 from pydantic import BaseModel as PyBaseModel, ConfigDict
 from buildings_bench.models.base_model import BaseModel
 import torch
@@ -70,6 +70,95 @@ class ModelArgs(PyBaseModel):
         extra="ignore",  # 多余键直接忽略；改成 "forbid" 可强制报错
         validate_assignment=True,  # 运行时修改字段也会做校验/转换
     )
+
+
+class TokenEmbedding(nn.Module):
+    """Helper Module to convert tensor of input
+    indices into corresponding tensor of token embeddings.
+    """
+
+    def __init__(self, vocab_size: int, emb_size: int):
+        """
+        Args:
+            vocab_size (int): number of quantized load values in the entire vocabulary.
+            emb_size (int): embedding size.
+        """
+        super(TokenEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.emb_size = emb_size
+
+    def forward(self, tokens: torch.Tensor):
+        return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
+
+
+class MoEPositionalEncoding(nn.Module):
+    """Helper Module that adds positional encoding to the token embedding to
+    introduce a notion of order within a time-series.
+    """
+
+    def __init__(self, emb_size: int, dropout: float, maxlen: int = 500):
+        """
+        Args:
+            emb_size (int): embedding size.
+            dropout (float): dropout rate.
+            maxlen (int): maximum possible length of the incoming time series.
+        """
+        super(MoEPositionalEncoding, self).__init__()
+        den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(-2)
+
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("pos_embedding", pos_embedding)
+
+    def forward(self, token_embedding: torch.Tensor) -> torch.Tensor:
+        # batch first - use size(1)
+        # need to permute token embeddings from [batch_size, seqlen x emb_size] to [seqlen x batch_size, emb_size]
+        return self.dropout(
+            token_embedding.permute(1, 0, 2)
+            + self.pos_embedding[: token_embedding.size(1), :]
+        ).permute(1, 0, 2)
+
+
+class TimeSeriesSinusoidalPeriodicEmbedding(nn.Module):
+    """This module produces a sinusoidal periodic embedding for a sequence of values in [-1, +1]."""
+
+    def __init__(self, embedding_dim: int) -> None:
+        """
+        Args:
+            embedding_dim (int): embedding size.
+        """
+        super().__init__()
+        self.linear = nn.Linear(2, embedding_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """`x` is expected to be [batch_size, seqlen, 1]."""
+        with torch.no_grad():
+            x = torch.cat([torch.sin(np.pi * x), torch.cos(np.pi * x)], dim=2)
+        # [batch_size, seqlen x 2] --> [batch_size, seqlen, embedding_dim]
+        return self.linear(x)
+
+
+class ZeroEmbedding(nn.Module):
+    """Outputs zeros of the desired output dim."""
+
+    def __init__(self, embedding_dim: int):
+        """
+        Args:
+            embedding_dim (int): embedding size.
+        """
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.zeros_embedding = nn.Parameter(
+            torch.zeros(1, 1, embedding_dim), requires_grad=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """`x` is expected to be [batch_size, seqlen, 1]."""
+        return self.zeros_embedding.repeat(x.shape[0], x.shape[1], 1)
 
 
 class RMSNorm(nn.Module):
@@ -287,7 +376,7 @@ class Encoder(nn.Module):
             args (ModelArgs): Model arguments containing block parameters.
         """
         super().__init__()
-        self.attn = nn.MultiheadAttention(  # ← PyTorch 自带
+        self.self_attn = nn.MultiheadAttention(
             embed_dim=args.dim, num_heads=args.n_heads, batch_first=True
         )
         self.ffn = (
@@ -301,26 +390,33 @@ class Encoder(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
+        src: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for the Transformer block.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            src (torch.Tensor): Input tensor.
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
 
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
-        x = self.attn_norm(x)
-        h, _ = self.attn(
-            x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask
+        q = k = v = self.attn_norm(src)
+        h, _ = self.self_attn(
+            q,
+            k,
+            v,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+            is_causal=is_causal,
         )
-        y = x + h
+        y = src + h
         z = y + self.ffn(self.ffn_norm(y))
         return z
 
@@ -343,7 +439,7 @@ class Decoder(nn.Module):
         """
         super().__init__()
         self.norm1 = RMSNorm(args.dim)
-        self.causal_attn = nn.MultiheadAttention(
+        self.self_attn = nn.MultiheadAttention(
             embed_dim=args.dim, num_heads=args.n_heads, batch_first=True
         )
         self.ffn = (
@@ -352,7 +448,7 @@ class Decoder(nn.Module):
             else MoE(args)
         )
         self.norm2 = RMSNorm(args.dim)
-        self.cross_attn = nn.MultiheadAttention(
+        self.multihead_attn = nn.MultiheadAttention(
             embed_dim=args.dim, num_heads=args.n_heads, batch_first=True
         )
         self.ffn_norm = RMSNorm(args.dim)
@@ -363,6 +459,14 @@ class Decoder(nn.Module):
         memory: torch.Tensor,  # [B, S_src, D] — 编码器输出
         tgt_mask: Optional[torch.Tensor] = None,  # causal mask
         memory_mask: Optional[torch.Tensor] = None,  # padding mask (可选)
+        tgt_key_padding_mask: Optional[
+            torch.Tensor
+        ] = None,  # padding mask for tgt (可选)
+        memory_key_padding_mask: Optional[
+            torch.Tensor
+        ] = None,  # padding mask for memory (可选
+        tgt_is_causal: bool = True,  # 是否使用因果注意力
+        memory_is_causal: bool = False,  # 是否使用因果注意力
     ) -> torch.Tensor:
         """
         Forward pass for the Transformer block.
@@ -377,11 +481,27 @@ class Decoder(nn.Module):
             torch.Tensor: Output tensor after block computation.
         """
         q = k = v = self.norm1(tgt)
-        attn_out, _ = self.causal_attn(q, k, v, attn_mask=tgt_mask)
+        attn_out, _ = self.self_attn(
+            q,
+            k,
+            v,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+            is_causal=tgt_is_causal,
+        )
         y = tgt + attn_out
         q = self.norm2(y)
         k = v = memory
-        cross_out, _ = self.cross_attn(q, k, v, attn_mask=memory_mask)
+        cross_out, _ = self.multihead_attn(
+            q,
+            k,
+            v,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+            is_causal=memory_is_causal,
+        )
         z = y + cross_out
         out = z + self.ffn(self.ffn_norm(z))
         return out
