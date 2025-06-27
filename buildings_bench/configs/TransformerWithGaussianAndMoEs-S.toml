@@ -11,16 +11,17 @@ dropout = 0.0
 continuous_loads = true
 ignore_spatial = false
 continuous_head = 'gaussian_nll'
-# num_experts = 4
+num_experts = 4
 top_k = 2
 # aux_loss_weight = 0.01
-num_groups = 2
-experts_per_gp = 2
+# num_groups = 2
+# experts_per_gp = 2
 
 [pretrain]
-batch_size = 1024
+name = 'TransformerWithGaussianAndMoEs-S-Update-01'
+batch_size = 2048
 init_scale = 0.02
-warmup_steps = 625
+warmup_steps = 1250
 lr = 0.00006
 train_tokens = 1000000000
 apply_scaler_transform = 'boxcox'
