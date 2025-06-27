@@ -235,18 +235,25 @@ def main(args, model_args):
         if args.disable_wandb:
             run = wandb.init(project=wandb_project, mode="disabled", config=args)
         elif args.resume_from_checkpoint != "":
-            run = wandb.init(
-                id=args.wandb_run_id,
+            # run = wandb.init(
+            #     id=args.wandb_run_id,
+            #     project=wandb_project,
+            #     notes=args.note,
+            #     resume="allow",
+            #     config=args,
+            # )
+            run_swanlab = swanlab.init(
                 project=wandb_project,
-                notes=args.note,
-                resume="allow",
+                experiment_name=args.name,
+                tags=[args.model, "pretraining"],
                 config=args,
             )
+            pass
         else:
             # run = wandb.init(project=wandb_project, notes=args.note, config=args)
             run_swanlab = swanlab.init(
                 project=wandb_project,
-                experiment_name=args.model,
+                experiment_name=args.name,
                 tags=[args.model, "pretraining"],
                 config=args,
             )
@@ -447,7 +454,7 @@ def main(args, model_args):
                 },
                 step=step,
             )
-            if args.model.startswith("TransformerWithGaussianAndMoEs"):
+            if args.model.startswith("_TransformerWithGaussianAndMoEs"):
                 # wandb.log(
                 #     {
                 #         "train/aux_loss": model.module.encoder.layers[
@@ -511,7 +518,15 @@ def main(args, model_args):
                 # 一次性记录所有子指标
                 swanlab.log(metrics, step=step)
 
-        if args.rank == 0 and step % 1000 == 0:
+        if args.rank == 0 and step % 500 == 0:
+            print(
+                f"rank {args.rank} step {step} loss {batch_loss:.5f} "
+                f"ppl {ppl:.5f} seen_tokens {seen_tokens / 1000000:.2f}M "
+                f"in {(secs_per_step):.2f} seconds",
+                flush=True,
+            )
+
+        if args.rank == 0 and step % 2000 == 0:
             start_time = timer()
             print(f"started validation at step {step}...")
 
