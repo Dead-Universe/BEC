@@ -227,26 +227,44 @@ class Buildings900K(torch.utils.data.Dataset):
                 == "01-01"
             ), "The weather file does not start from Jan 1st"
 
-            weather_df.columns = ["timestamp"] + self.weather_inputs
+            weather_df.columns = ["timestamp"] + [
+                "temperature",
+                "humidity",
+                "wind_speed",
+                "wind_direction",
+                "global_horizontal_radiation",
+                "direct_normal_radiation",
+                "diffuse_horizontal_radiation",
+            ]
             weather_df = weather_df[["timestamp"] + self.weather_inputs]
             # weather_df = weather_df.iloc[:-1] # remove last hour to align with load data
 
             # TODO: At test time, I think we are removing a row from the DF. Make sure these are the same.
             # add -1 because the file starts from 01:00:00
-            weather_df = weather_df.iloc[
-                seq_ptr - self.context_len - 1 : seq_ptr + self.pred_len - 1
-            ]
+            start_idx = max(0, seq_ptr - self.context_len - 1)
+            end_idx = min(len(weather_df), seq_ptr + self.pred_len - 1)
+            if start_idx < end_idx:
+                weather_slice = weather_df.iloc[start_idx:end_idx].copy()
+            else:
+                weather_slice = pd.DataFrame(columns=self.weather_inputs)
+            if len(weather_slice) < self.context_len + self.pred_len:
+                padding = pd.DataFrame(
+                    np.nan,
+                    index=range(self.context_len + self.pred_len - len(weather_slice)),
+                    columns=self.weather_inputs,
+                )
+                weather_slice = pd.concat([weather_slice, padding])
 
             # convert temperature to fahrenheit (note: keep celsius for now)
             # weather_df['temperature'] = weather_df['temperature'].apply(lambda x: x * 1.8 + 32)
 
             # transform
-            for idx, col in enumerate(weather_df.columns[1:]):
+            for idx, col in enumerate(self.weather_inputs):
                 ## WARNING: CONVERTS TO TORCH FROM NUMPY AUTOMATICALLY
                 sample.update(
                     {
                         col: self.weather_transforms[idx].transform(
-                            weather_df[col].to_numpy()
+                            weather_slice[col].fillna(0).to_numpy()
                         )[0][..., None]
                     }
                 )
@@ -301,11 +319,11 @@ if __name__ == "__main__":
     weather_inputs = [
         "temperature",
         "humidity",
-        "wind_speed",
-        "wind_direction",
-        "global_horizontal_radiation",
-        "direct_normal_radiation",
-        "diffuse_horizontal_radiation",
+        # "wind_speed",
+        # "wind_direction",
+        # "global_horizontal_radiation",
+        # "direct_normal_radiation",
+        # "diffuse_horizontal_radiation",
     ]
     dataset = Buildings900K(
         dataset_path,

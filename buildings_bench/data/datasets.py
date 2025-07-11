@@ -28,10 +28,10 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
         pred_len: int = 24,
         sliding_window: int = 24,
         apply_scaler_transform: str = "",
-        scaler_transform_path: Path = None,
+        scaler_transform_path: Path | None = None,
         is_leap_year=False,
-        weather_dataframe: pd.DataFrame = None,
-        weather_transform_path: Path = None,
+        weather_dataframe: pd.DataFrame | None = None,
+        weather_transform_path: Path | None = None,
     ):
         """
         Args:
@@ -116,7 +116,9 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
 
             # transform
             weather_transform = StandardScalerTransform()
-            for col in weather_df.columns[1:]:
+            if "timestamp" in weather_df.columns:
+                weather_df = weather_df.drop(columns=["timestamp"])
+            for col in weather_df.columns:
                 weather_transform.load(self.weather_transform_path / col)
                 sample.update(
                     {
@@ -125,6 +127,7 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
                         ]
                     }
                 )
+
             return sample
 
 
@@ -196,7 +199,15 @@ class TorchBuildingDatasetFromParquet:
                     == "01-01"
                 ), "The weather file does not start from Jan 1st"
 
-                weather_df.columns = ["timestamp"] + weather_inputs
+                weather_df.columns = ["timestamp"] + [
+                    "temperature",
+                    "humidity",
+                    "wind_speed",
+                    "wind_direction",
+                    "global_horizontal_radiation",
+                    "direct_normal_radiation",
+                    "diffuse_horizontal_radiation",
+                ]
                 weather_df = weather_df[["timestamp"] + weather_inputs]
 
             df = pq.read_table(parquet_data)
@@ -306,7 +317,7 @@ class TorchBuildingDatasetsFromCSV:
             if ds_name != "SMART" and ds_name != "BDG-2":
                 # TODO: finalize the weather source
                 weather_df = pd.read_csv(
-                    data_path / f"{ds_name}" / "weather_isd.csv",
+                    data_path / f"{ds_name}" / "weather_era5.csv",
                     index_col=0,
                     header=0,
                     parse_dates=True,
