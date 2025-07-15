@@ -20,9 +20,9 @@ export CUDA_VISIBLE_DEVICES=0
 
 # 4. 运行 zero-shot 脚本
 $PYTHON scripts/zero_shot.py \
-    --model TimeSeriesTransformer-S \
+    --model TransformerWithGaussianAndMoEs-S \
     --benchmark all \
-    --checkpoint checkpoints/TimeSeriesTransformer-S_best.pt \
+    --checkpoint checkpoints/TransformerWithGaussianAndMoEs-S_best.pt \
     --apply_scaler_transform boxcox
 
 # $PYTHON scripts/zero_shot.py \
