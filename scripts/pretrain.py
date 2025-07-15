@@ -22,6 +22,10 @@ from buildings_bench.models import model_factory
 from buildings_bench.evaluation.metrics import MetricType
 from buildings_bench.evaluation import metrics_factory
 from buildings_bench.evaluation import scoring_rule_factory
+from buildings_bench.data.new import build_datasets, worker_init_fn
+from buildings_bench.transforms import BoxCoxTransform, StandardScalerTransform
+
+DATASET_FULL = True
 
 SCRIPT_PATH = Path(os.path.realpath(__file__)).parent
 
@@ -46,6 +50,15 @@ def validation(
                 "nrmse", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY]
             )
             + metrics_factory("nmae", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
+        )
+    elif model.module.continuous_head == "mse":
+        metrics_manager = MetricsManager(
+            metrics=metrics_factory(
+                "nrmse", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY]
+            )
+            + metrics_factory(
+                "nmae", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY]
+            ),
         )
     elif model.module.continuous_loads:
         metrics_manager = MetricsManager(
@@ -84,6 +97,8 @@ def validation(
             preds = model(batch)
             batch_loss = loss(preds, targets)
             predictions, distribution_params = predict(batch)
+            if model.module.continuous_head == "mse":
+                distribution_params = None
 
         predictions = inverse_transform(predictions)
 
@@ -91,14 +106,20 @@ def validation(
             continuous_targets = inverse_transform(continuous_targets)
             # unscale for crps
             targets = inverse_transform(targets)
-            if args.apply_scaler_transform == "standard":
+            if (
+                args.apply_scaler_transform == "standard"
+                and distribution_params is not None
+            ):
                 mu = inverse_transform(distribution_params[:, :, 0])
                 sigma = load_transform.undo_transform_std(distribution_params[:, :, 1])
                 distribution_params = torch.cat(
                     [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
                 )
 
-            elif args.apply_scaler_transform == "boxcox":
+            elif (
+                args.apply_scaler_transform == "boxcox"
+                and distribution_params is not None
+            ):
                 ######## approximate Gaussian in unscaled space ########
                 mu = inverse_transform(distribution_params[:, :, 0])
                 muplussigma = inverse_transform(torch.sum(distribution_params, -1))
@@ -273,68 +294,124 @@ def main(args, model_args):
 
     #################### Dataset setup ####################
 
-    train_dataset = load_pretraining(
-        "buildings-900k-train",
-        args.num_buildings,
-        args.apply_scaler_transform,
-        transform_path,
-        weather_inputs=model_args["weather_inputs"],
-        custom_idx_filename=args.train_idx_filename,
-    )
+    if DATASET_FULL == True:
+        train_dataset, val_dataset = build_datasets()  # 返回 ConcatDataset
 
-    val_dataset = load_pretraining(
-        "buildings-900k-val",
-        args.num_buildings,
-        args.apply_scaler_transform,
-        transform_path,
-        weather_inputs=model_args["weather_inputs"],
-        custom_idx_filename=args.val_idx_filename,
-    )
-
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset=train_dataset,
-        num_replicas=args.world_size,
-        rank=args.rank,
-        shuffle=True,
-    )
-    # val_sampler = torch.utils.data.distributed.DistributedSampler(
-    #                                  dataset=val_dataset,
-    #                                  num_replicas=args.world_size,
-    #                                  rank=args.rank, shuffle=False)
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        drop_last=False,
-        worker_init_fn=utils.worker_init_fn_eulp,
-        collate_fn=train_dataset.collate_fn(),
-        shuffle=(train_sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        # sampler=val_sampler,
-        drop_last=False,
-        worker_init_fn=utils.worker_init_fn_eulp,
-        collate_fn=val_dataset.collate_fn(),
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-
-    if not model.continuous_loads:
-        load_transform = LoadQuantizer(
-            with_merge=(not args.tokenizer_without_merge),
-            num_centroids=model.vocab_size,
-            device=f"cuda:{local_rank}",
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset=train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
         )
+
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            drop_last=False,
+            worker_init_fn=worker_init_fn,
+            collate_fn=torch.utils.data.default_collate,
+            shuffle=(train_sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            # sampler=val_sampler,
+            drop_last=False,
+            worker_init_fn=worker_init_fn,
+            collate_fn=torch.utils.data.default_collate,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        if args.apply_scaler_transform == "boxcox":
+            load_transform = BoxCoxTransform()
+        elif args.apply_scaler_transform == "standard":
+            load_transform = StandardScalerTransform()
+
+        transform_path = (
+            Path(os.environ.get("BUILDINGS_BENCH", "")) / "metadata" / "transforms"
+        )
+
         load_transform.load(transform_path)
+
+        if not model.continuous_loads:
+            load_transform = LoadQuantizer(
+                with_merge=(not args.tokenizer_without_merge),
+                num_centroids=model.vocab_size,
+                device=f"cuda:{local_rank}",
+            )
+            load_transform.load(transform_path)
+        else:
+            load_transform = load_transform
     else:
-        load_transform = train_dataset.load_transform
+
+        train_dataset = load_pretraining(
+            "buildings-900k-train",
+            args.num_buildings,
+            args.apply_scaler_transform,
+            transform_path,
+            weather_inputs=model_args["weather_inputs"],
+            custom_idx_filename=args.train_idx_filename,
+        )
+
+        val_dataset = load_pretraining(
+            "buildings-900k-val",
+            args.num_buildings,
+            args.apply_scaler_transform,
+            transform_path,
+            weather_inputs=model_args["weather_inputs"],
+            custom_idx_filename=args.val_idx_filename,
+        )
+
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset=train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+        )
+        # val_sampler = torch.utils.data.distributed.DistributedSampler(
+        #                                  dataset=val_dataset,
+        #                                  num_replicas=args.world_size,
+        #                                  rank=args.rank, shuffle=False)
+
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            drop_last=False,
+            worker_init_fn=utils.worker_init_fn_eulp,
+            collate_fn=train_dataset.collate_fn(),
+            shuffle=(train_sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            # sampler=val_sampler,
+            drop_last=False,
+            worker_init_fn=utils.worker_init_fn_eulp,
+            collate_fn=val_dataset.collate_fn(),
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        if not model.continuous_loads:
+            load_transform = LoadQuantizer(
+                with_merge=(not args.tokenizer_without_merge),
+                num_centroids=model.vocab_size,
+                device=f"cuda:{local_rank}",
+            )
+            load_transform.load(transform_path)
+        else:
+            load_transform = train_dataset.load_transform
 
     if not model.continuous_loads:
         transform = load_transform.transform
@@ -436,7 +513,7 @@ def main(args, model_args):
 
         ppl = torch.exp(batch_loss.detach())
 
-        if args.rank == 0 and step % 50 == 0:
+        if args.rank == 0 and step % 500 == 0:
             # wandb.log(
             #     {
             #         "train/loss": batch_loss,
@@ -521,7 +598,7 @@ def main(args, model_args):
                 # 一次性记录所有子指标
                 swanlab.log(metrics, step=step)
 
-        if args.rank == 0 and step % 500 == 0:
+        if args.rank == 0 and step % 1000 == 0:
             print(
                 f"rank {args.rank} step {step} loss {batch_loss:.5f} "
                 f"ppl {ppl:.5f} seen_tokens {seen_tokens / 1000000:.2f}M "
