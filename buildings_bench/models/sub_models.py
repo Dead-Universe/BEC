@@ -243,7 +243,7 @@ class Gate(nn.Module):
 
         # 多组路由逻辑
         if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
+            scores = scores.reshape(x.size(0), self.n_groups, -1)
             if self.bias is None:
                 group_scores = scores.amax(dim=-1)
             else:
@@ -342,7 +342,7 @@ class MoE(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
         """
         shape = x.size()
-        x = x.view(-1, self.dim)
+        x = x.reshape(-1, self.dim)
         weights, indices = self.gate(x)
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
@@ -353,7 +353,7 @@ class MoE(nn.Module):
             expert = self.experts[i]
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
-        return (y + z).view(shape)
+        return (y + z).reshape(shape)
 
 
 class Encoder(nn.Module):
