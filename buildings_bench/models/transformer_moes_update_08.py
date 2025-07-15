@@ -1,5 +1,3 @@
-# DeepSeekFeedForward
-
 import torch
 from typing import Tuple, Dict, List
 from torch import nn
@@ -17,9 +15,7 @@ from buildings_bench.models.sub_models import (
 
 
 class LoadForecastingTransformerMoE(BaseModel):
-    """
-    Encoder-Decoder Transformer with DeepSeek-MoE FFN.
-    """
+    """ """
 
     def __init__(
         self,
