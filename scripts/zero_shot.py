@@ -126,7 +126,18 @@ def zero_shot_learning(args, model_args, results_path: Path):
         else model.continuous_loads
     ):
         metrics_manager = DatasetMetricsManager(
-            scoring_rule=scoring_rule_factory("crps") if not is_fm else None
+            scoring_rule=(
+                scoring_rule_factory("crps")
+                if (
+                    not is_fm
+                    and (
+                        model.module.continuous_head != "mse"
+                        if isinstance(model, torch.nn.DataParallel)
+                        else model.continuous_head != "mse"
+                    )
+                )
+                else None
+            )
         )
     else:
         metrics_manager = DatasetMetricsManager(
@@ -421,13 +432,25 @@ def zero_shot_learning(args, model_args, results_path: Path):
                     else:
                         predictions, distribution_params = predict(batch)
 
+                    if (
+                        isinstance(model, torch.nn.DataParallel)
+                        and model.module.continuous_head == "mse"
+                    ) or (
+                        not isinstance(model, torch.nn.DataParallel)
+                        and model.continuous_head == "mse"
+                    ):
+                        distribution_params = None
+
                     predictions = inverse_transform(predictions)
 
                     if args.apply_scaler_transform != "":
                         continuous_targets = inverse_transform(continuous_targets)
                         # invert for crps
                         targets = inverse_transform(targets)
-                        if args.apply_scaler_transform == "standard":
+                        if (
+                            args.apply_scaler_transform == "standard"
+                            and distribution_params is not None
+                        ):
                             mu = inverse_transform(distribution_params[:, :, 0])
                             sigma = load_transform.undo_transform_std(
                                 distribution_params[:, :, 1]
@@ -436,7 +459,10 @@ def zero_shot_learning(args, model_args, results_path: Path):
                                 [mu.unsqueeze(-1), sigma.unsqueeze(-1)], -1
                             )
 
-                        elif args.apply_scaler_transform == "boxcox":
+                        elif (
+                            args.apply_scaler_transform == "boxcox"
+                            and distribution_params is not None
+                        ):
                             ######## backproject approximate Gaussian in unscaled space ########
                             mu = inverse_transform(distribution_params[:, :, 0])
                             muplussigma = inverse_transform(
@@ -484,7 +510,11 @@ def zero_shot_learning(args, model_args, results_path: Path):
     metrics_file = results_path / f"metrics_{args.model}{variant_name}.csv"
     scoring_rule_file = results_path / f"scoring_rule_{args.model}{variant_name}.csv"
 
-    if not args.ignore_scoring_rules:
+    if not args.ignore_scoring_rules and (
+        model.module.continuous_head != "mse"
+        if isinstance(model, torch.nn.DataParallel)
+        else model.continuous_head != "mse"
+    ):
         metrics_df, scoring_rule_df = metrics_manager.summary()
 
         metrics_df.to_csv(metrics_file, index=False)
