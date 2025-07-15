@@ -231,7 +231,8 @@ def main(args, model_args):
         if wandb_project == "":
             print("WANDB_PROJECT environment variable not set, disabling wandb")
             args.disable_wandb = True
-
+        config_dict = vars(args).copy()
+        config_dict["model_args"] = model_args
         if args.disable_wandb:
             run = wandb.init(project=wandb_project, mode="disabled", config=args)
         elif args.resume_from_checkpoint != "":
@@ -246,7 +247,7 @@ def main(args, model_args):
                 project=wandb_project,
                 experiment_name=args.name,
                 tags=[args.model, "pretraining"],
-                config=args,
+                config=config_dict,
             )
             pass
         else:
@@ -255,7 +256,7 @@ def main(args, model_args):
                 project=wandb_project,
                 experiment_name=args.name,
                 tags=[args.model, "pretraining"],
-                config=args,
+                config=config_dict,
             )
 
     global_batch_size = args.world_size * args.batch_size
@@ -362,7 +363,9 @@ def main(args, model_args):
     train_steps = args.train_tokens // (global_batch_size * model.module.pred_len)
 
     scheduler = transformers.get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=train_steps
+        optimizer,
+        num_warmup_steps=int(0.02 * train_steps),
+        num_training_steps=train_steps,
     )
 
     scaler = torch.amp.GradScaler()
@@ -526,7 +529,7 @@ def main(args, model_args):
                 flush=True,
             )
 
-        if args.rank == 0 and step % 2000 == 0:
+        if args.rank == 0 and step % 4000 == 0:
             start_time = timer()
             print(f"started validation at step {step}...")
 
