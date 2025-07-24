@@ -3,12 +3,11 @@ import numpy as np
 import os, torch
 from torch.utils.data import ConcatDataset, random_split, DataLoader
 from buildings_bench.data import load_pretraining, load_torch_dataset
-from buildings_bench.data.buildings900K import Buildings900K
 
 # ----------------- 公共参数 -----------------
 common_kwargs = dict(
-    context_len=168,
-    pred_len=24,
+    context_len=336,
+    pred_len=168,
     apply_scaler_transform="boxcox",
     scaler_transform_path=Path(os.environ["BUILDINGS_BENCH"]) / "metadata/transforms",
     weather_inputs=None,
@@ -112,7 +111,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 def worker_init_fn(worker_id):
     # 只对 Buildings-900K 子集调用 init_fp()
-    from buildings_bench.data.buildings900K import Buildings900K
+    from buildings_bench.data.buildings900K_new import Buildings900K
 
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 

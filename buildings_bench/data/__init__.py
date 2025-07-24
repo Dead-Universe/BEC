@@ -2,7 +2,7 @@ from pathlib import Path
 import torch
 import tomli
 import os
-from buildings_bench.data.buildings900K import Buildings900K
+from buildings_bench.data.buildings900K_new import Buildings900K
 from buildings_bench.data.datasets import TorchBuildingDatasetsFromCSV
 from buildings_bench.data.datasets import TorchBuildingDatasetFromParquet
 from buildings_bench.data.datasets import PandasBuildingDatasetsFromCSV
