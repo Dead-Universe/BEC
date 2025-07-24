@@ -70,11 +70,11 @@ def build_datasets():
 
     custom_full = concat_all(custom_registry)
 
-    custom_train, custom_val = split_dataset(custom_full, TRAIN_VAL_RATIO, RANDOM_SEED)
+    # custom_train, custom_val = split_dataset(custom_full, TRAIN_VAL_RATIO, RANDOM_SEED)
 
     # ------------- 最终训练 / 验证合集 -----------------
-    train_dataset = ConcatDataset([pretrain_train, custom_train])
-    val_dataset = ConcatDataset([pretrain_val, custom_val])
+    train_dataset = ConcatDataset([pretrain_train, custom_full])
+    val_dataset = ConcatDataset([pretrain_val])
 
     # train_loader = DataLoader(
     #     train_dataset,
