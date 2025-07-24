@@ -19,11 +19,11 @@ class BoxCoxTransform:
         self.boxcox = None
         self.max_datapoints = max_datapoints
 
-    def train(self, data: np.array) -> None:
+    def train(self, data: np.ndarray) -> None:
         """Train the Box-Cox transform on the data with sklearn.preprocessing.PowerTransformer.
 
         Args:
-            data (np.array): of shape (n, 1) or (b,n,1)
+            data (np.ndarray): of shape (n, 1) or (b,n,1)
         """
         self.boxcox = preprocessing.PowerTransformer(method="box-cox", standardize=True)
         data = data.flatten().reshape(-1, 1)
