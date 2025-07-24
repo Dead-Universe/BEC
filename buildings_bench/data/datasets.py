@@ -357,6 +357,13 @@ class TorchBuildingDatasetsFromCSV:
             for bldg_name, bldg_df in zip(bldg_names, dfs):
                 bldg_df.rename(columns={bldg_df.columns[0]: "power"}, inplace=True)
 
+                min_required = context_len + pred_len  # 最少要这么多行
+                if len(bldg_df) < min_required:
+                    print(
+                        f"Skipping {bldg_name} ({year}) due to insufficient data: {len(bldg_df)} < {min_required}"
+                    )
+                    continue  # 跳过本次循环
+
                 if not bldg_name in self.building_datasets:
                     self.building_datasets[bldg_name] = []
 
