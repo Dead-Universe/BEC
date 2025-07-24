@@ -205,6 +205,7 @@ def zero_shot_learning(args, model_args, results_path: Path):
                     full_len = context_len + forecast_horizon
                     # A) pull out your 168+24 window
                     arr = batch["load"][..., 0].cpu().numpy()  # (B, 192)
+                    arr = inverse_transform(arr)
                     X_ctx = arr[:, :context_len]  # (B,168)
                     Y_true = torch.tensor(
                         arr[:, context_len:full_len],
@@ -295,6 +296,7 @@ def zero_shot_learning(args, model_args, results_path: Path):
                     pass
                 elif kind == "timemoe":
                     arr = batch["load"][..., 0].cpu().numpy()
+                    arr = inverse_transform(arr)
                     X_ctx = arr[:, :context_len]  # (B,168)
                     Y_true = torch.tensor(
                         arr[:, context_len : context_len + forecast_horizon],
@@ -337,6 +339,7 @@ def zero_shot_learning(args, model_args, results_path: Path):
                 elif kind == "chronos":
                     # A) 从 batch 中取出原始负荷序列 (B, T, 1) → (B, T)
                     arr = batch["load"][..., 0].cpu().numpy()
+                    arr = inverse_transform(arr)
 
                     # 新增：定义子批次大小 (根据内存调整)
                     sub_batch_size = 48  # 可调参数，建议设为2的幂次
@@ -542,28 +545,55 @@ def zero_shot_learning(args, model_args, results_path: Path):
             # Returns a dictionary with the median of the nrmse (cv-rmse)
             # and crps metrics for the model with boostrapped 95% confidence intervals
             print("BuildingsBench (real)")
-            results_dict = aggregate.return_aggregate_median(
+            real_med = aggregate.return_aggregate(
                 model_list=[f"{args.model}{variant_name}"],
                 results_dir=str(results_path),
                 experiment="zero_shot",
                 metrics=metric_names,
+                aggregate="median",  # ← 新增参数
                 exclude_simulated=True,
                 oov_list=oov_bldgs,
             )
-            aggregate.pretty_print_aggregates(results_dict)
+            aggregate.pretty_print(real_med, aggregate="median")
 
-        if "buildings-900k-test" in args.benchmark:
-            print("Buildings-900K-test (synth)")
-            results_dict = aggregate.return_aggregate_median(
+            # ------- （可选）同时算“均值” -------
+            real_mean = aggregate.return_aggregate(
                 model_list=[f"{args.model}{variant_name}"],
                 results_dir=str(results_path),
                 experiment="zero_shot",
                 metrics=metric_names,
+                aggregate="mean",  # ← 换成 mean
+                exclude_simulated=True,
+                oov_list=oov_bldgs,
+            )
+            aggregate.pretty_print(real_mean, aggregate="mean")
+
+        if "buildings-900k-test" in args.benchmark:
+            print("Buildings-900K-test (synth)")
+            synth_med = aggregate.return_aggregate(
+                model_list=[f"{args.model}{variant_name}"],
+                results_dir=str(results_path),
+                experiment="zero_shot",
+                metrics=metric_names,
+                aggregate="median",
                 exclude_simulated=False,
                 only_simulated=True,
                 oov_list=oov_bldgs,
             )
-            aggregate.pretty_print_aggregates(results_dict)
+            aggregate.pretty_print(synth_med, aggregate="median")
+
+            # （可选）均值
+            synth_mean = aggregate.return_aggregate(
+                model_list=[f"{args.model}{variant_name}"],
+                results_dir=str(results_path),
+                experiment="zero_shot",
+                metrics=metric_names,
+                aggregate="mean",
+                exclude_simulated=False,
+                only_simulated=True,
+                oov_list=oov_bldgs,
+            )
+            aggregate.pretty_print(synth_mean, aggregate="mean")
 
 
 if __name__ == "__main__":
