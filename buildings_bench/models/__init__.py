@@ -12,7 +12,7 @@ from buildings_bench.models.persistence import (
     CopyLastWeekPersistence,
 )
 from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
-from buildings_bench.models.transformer_moes_update_06 import (
+from buildings_bench.models.transformer_moes_update_12 import (
     LoadForecastingTransformerMoE,
 )
 from buildings_bench.models.sub_models import TimeSeriesTransformer
