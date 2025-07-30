@@ -150,14 +150,42 @@ def pretty_print_aggregates(results_dict) -> None:
 #         )
 #     )
 
-from buildings_bench.evaluation.managers import BuildingTypes
-
-
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from rliable import library as rly
 from buildings_bench.evaluation.managers import BuildingTypes
+
+
+def drop_extreme_iqr(
+    df: pd.DataFrame,
+    value_col: str = "value",
+    k: float = 1.5,
+    extreme_k: float = 10.0,
+) -> pd.DataFrame:
+    """
+    返回 *剔除极端异常行* 的 DataFrame 副本，原 df 不变。
+    """
+    s = pd.to_numeric(df[value_col], errors="coerce")  # 强转成数值
+    finite = s[np.isfinite(s)]
+    if len(finite) < 2:  # 样本太少无法建 IQR
+        return df.copy()
+
+    q1, q3 = finite.quantile([0.25, 0.75])
+    iqr = q3 - q1 if q3 > q1 else 0.0
+    lower, upper = q1 - k * iqr, q3 + k * iqr
+
+    def _is_extreme(v):
+        if not np.isfinite(v):
+            return True  # NaN / ±inf → 极端
+        if iqr == 0:  # IQR 为 0 → 没法算比例，保守地不删
+            return False
+        bound = lower if v < lower else upper
+        dist_ratio = abs(v - bound) / iqr
+        return dist_ratio >= extreme_k
+
+    mask_extreme = s.apply(_is_extreme)
+    return df.loc[~mask_extreme].copy()
 
 
 def _aggregate_scores(
@@ -176,6 +204,138 @@ def _aggregate_scores(
     scores = {m: v.values.reshape(-1, 1) for m, v in df.groupby("model")["value"]}
     agg_scores, agg_cis = rly.get_interval_estimates(scores, func, reps=reps)
     return agg_scores, agg_cis
+
+
+# def return_aggregate(
+#     model_list,
+#     results_dir,
+#     experiment="zero_shot",
+#     metrics=("cvrmse",),
+#     aggregate="median",  # 'median' | 'mean'
+#     exclude_simulated=True,
+#     only_simulated=False,
+#     oov_list=(),
+#     reps=50_000,
+# ):
+#     """
+#     计算指定模型在不同 building_type / metric / dataset 下的聚合（均值或中位数）及 95% bootstrap CI。
+#     - 遇到 `inf` / `nan` 会打印详细警告并删除对应行，避免最终结果为 `nan`。
+
+#     Returns
+#     -------
+#     result_dict : dict
+#         result_dict[building_type][metric][dataset_tag][model] = (score, [lo, hi])
+#         其中 dataset_tag == "_overall" 表示跨数据集总体结果。
+#     """
+#     metrics = list(set(metrics))
+#     BTYPES = [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]
+
+#     result_dict = {bt: {m: {} for m in metrics} for bt in BTYPES}
+
+#     # ---------- 读取一次 CSV，避免重复 I/O ---------- #
+#     cache = {}
+
+#     def load_csv(prefix, model):
+#         key = (prefix, model)
+#         if key not in cache:
+#             cache[key] = pd.read_csv(Path(results_dir) / f"{prefix}_{model}.csv")
+#         return cache[key].copy()
+
+#     # ---------- 主循环 ---------- #
+#     for bt in BTYPES:
+#         for metric in metrics:
+#             concat_dfs = []
+#             for model in model_list:
+#                 # 选择文件前缀
+#                 prefix = "scoring_rule" if metric in ("rps", "crps") else "metrics"
+#                 if experiment == "transfer_learning":
+#                     prefix = "TL_" + prefix
+
+#                 df = load_csv(prefix, model)
+#                 df["model"] = model
+
+#                 # ----------- 基础过滤 ----------- #
+#                 if oov_list:
+#                     df = df[~df["building_id"].str.contains("|".join(oov_list))]
+
+#                 if exclude_simulated:
+#                     df = df[
+#                         ~df["dataset"].isin(
+#                             {"buildings-900k-test", "buildings-1m-test"}
+#                         )
+#                     ]
+#                 elif only_simulated:
+#                     df = df[
+#                         df["dataset"].isin({"buildings-900k-test", "buildings-1m-test"})
+#                     ]
+
+#                 # 只保留当前 metric
+#                 if metric not in ("rps", "crps"):
+#                     cond = (df["metric"] == metric) | df["metric"].str.startswith(
+#                         metric + "_"
+#                     )
+#                     df = df[cond]
+
+#                 # 只保留当前 building_type
+#                 df = df[df["building_type"] == bt]
+
+#                 # ----------- inf / nan 处理 ----------- #
+#                 # n_nan = df["value"].isna().sum()
+#                 # n_inf = np.isinf(df["value"]).sum()
+#                 # if n_nan or n_inf:
+#                 #     print(
+#                 #         f"Warning: model '{model}' ({bt}-{metric}) contains "
+#                 #         f"{n_nan} NaN, {n_inf} inf — rows will be dropped."
+#                 #     )
+#                 # df["value"] = df["value"].replace(np.inf, np.nan)
+#                 # df = df.dropna(subset=["value"])
+
+#                 before = len(df)
+#                 df = drop_extreme_iqr(df, k=1.5, extreme_k=10)
+#                 after = len(df)
+#                 if before != after:
+#                     print(
+#                         f"[INFO] {model} ({bt}-{metric}) dropped {before - after} extreme outliers."
+#                     )
+
+#                 concat_dfs.append(df)
+
+#             # 合并所有模型数据用于整体聚合
+#             all_df = (
+#                 pd.concat(concat_dfs, ignore_index=True)
+#                 if concat_dfs
+#                 else pd.DataFrame()
+#             )
+
+#             # ---- (1) 总体聚合 ---- #
+#             result_dict[bt][metric]["_overall"] = {}
+#             if not all_df.empty:
+#                 overall_scores, overall_cis = _aggregate_scores(all_df, aggregate, reps)
+#                 for m in model_list:
+#                     if m in overall_scores:
+#                         result_dict[bt][metric]["_overall"][m] = (
+#                             overall_scores[m][0],
+#                             overall_cis[m][:, 0],
+#                         )
+#                     else:
+#                         print(
+#                             f"[WARN] {m} has no valid samples for {bt}-{metric}-OVERALL"
+#                         )
+
+#             # ---- (2) 按 dataset 聚合 ---- #
+#             for dname, sub_df in all_df.groupby("dataset"):
+#                 ds_scores, ds_cis = _aggregate_scores(sub_df, aggregate, reps)
+#                 result_dict[bt][metric][dname] = {}
+#                 for m in model_list:
+#                     if m in ds_scores:
+#                         result_dict[bt][metric][dname][m] = (
+#                             ds_scores[m][0],
+#                             ds_cis[m][:, 0],
+#                         )
+#                     else:
+#                         print(f"[WARN] {m} has no samples in dataset '{dname}'")
+
+#     return result_dict
 
 
 def return_aggregate(
@@ -329,7 +489,7 @@ if __name__ == "__main__":
     import os
 
     results_dir = "/home/hadoop/bec/BuildingsBench/results"
-    models = ["timemoe"]
+    models = ["timemoe", "TransformerWithGaussianAndMoEs-L-dataset-full"]
 
     oov = []  # ← 你的 oov 列表
     with open(Path(os.environ["BUILDINGS_BENCH"]) / "metadata" / "oov.txt") as f:
@@ -340,7 +500,7 @@ if __name__ == "__main__":
         models,
         results_dir,
         experiment="zero_shot",
-        metrics=["nrmse", "nmae", "nmbe"],
+        metrics=["nrmse", "nmae"],
         aggregate="median",
         oov_list=oov,
     )
@@ -351,7 +511,7 @@ if __name__ == "__main__":
         models,
         results_dir,
         experiment="zero_shot",
-        metrics=["nrmse", "nmae", "nmbe"],
+        metrics=["nrmse", "nmae"],
         aggregate="mean",
         oov_list=oov,
     )
