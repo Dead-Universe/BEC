@@ -131,9 +131,9 @@ def zero_shot_learning(args, model_args, results_path: Path):
                 if (
                     not is_fm
                     and (
-                        model.module.continuous_head != "mse"
+                        model.module.continuous_head == "gaussian_nll"
                         if isinstance(model, torch.nn.DataParallel)
-                        else model.continuous_head != "mse"
+                        else model.continuous_head == "gaussian_nll"
                     )
                 )
                 else None
@@ -437,10 +437,10 @@ def zero_shot_learning(args, model_args, results_path: Path):
 
                     if (
                         isinstance(model, torch.nn.DataParallel)
-                        and model.module.continuous_head == "mse"
+                        and model.module.continuous_head != "gaussian_nll"
                     ) or (
                         not isinstance(model, torch.nn.DataParallel)
-                        and model.continuous_head == "mse"
+                        and model.continuous_head != "gaussian_nll"
                     ):
                         distribution_params = None
 
@@ -514,9 +514,9 @@ def zero_shot_learning(args, model_args, results_path: Path):
     scoring_rule_file = results_path / f"scoring_rule_{args.model}{variant_name}.csv"
 
     if not args.ignore_scoring_rules and (
-        model.module.continuous_head != "mse"
+        model.module.continuous_head == "gaussian_nll"
         if isinstance(model, torch.nn.DataParallel)
-        else model.continuous_head != "mse"
+        else model.continuous_head == "gaussian_nll"
     ):
         metrics_df, scoring_rule_df = metrics_manager.summary()
 
