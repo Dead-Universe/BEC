@@ -1,17 +1,10 @@
 from pathlib import Path
+import tempfile
+from typing import List, Set
 import numpy as np
 import os, torch
 from torch.utils.data import ConcatDataset, random_split, DataLoader
 from buildings_bench.data import load_pretraining, load_torch_dataset
-
-# ----------------- 公共参数 -----------------
-common_kwargs = dict(
-    context_len=336,
-    pred_len=168,
-    apply_scaler_transform="boxcox",
-    scaler_transform_path=Path(os.environ["BUILDINGS_BENCH"]) / "metadata/transforms",
-    weather_inputs=None,
-)
 
 TRAIN_VAL_RATIO = 0.8  # 8 : 2
 RANDOM_SEED = 42  # 保证可复现
@@ -28,14 +21,46 @@ custom_registry = [
     "electricity",
     "smart",
     "lcl",
+    "university",
 ]
 
 
-def concat_all(registry):
+def _merge_oov_files(oov_paths: List[Path]) -> Path:
+    """把多份 oov_xx.txt merge 成一个临时文件，返回其路径"""
+    all_ids: Set[str] = set()
+    for p in oov_paths:
+        if p is None or not p.exists():
+            continue
+        all_ids.update(x.strip() for x in p.read_text().splitlines() if x.strip())
+    tf = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix="_union_oov.txt")
+    tf.write("\n".join(sorted(all_ids)))
+    tf.close()
+    return Path(tf.name)
+
+
+def concat_all(
+    registry,
+    context_len=168,
+    pred_len=24,
+    apply_scaler_transform="boxcox",
+    scaler_transform_path=Path(os.environ["BUILDINGS_BENCH"]) / "metadata/transforms",
+    weather_inputs=None,
+    split: str = "",  # '', 'train', 'test'
+    oov_path: Path | None = None,  # Path to oov.txt
+):
     """把 registry 里的所有楼栋 dataset 拼成一个 ConcatDataset"""
     ds_list = []
     for name in registry:
-        gen = load_torch_dataset(name, **common_kwargs)
+        gen = load_torch_dataset(
+            name,
+            context_len=context_len,
+            pred_len=pred_len,
+            apply_scaler_transform=apply_scaler_transform,
+            scaler_transform_path=scaler_transform_path,
+            weather_inputs=weather_inputs,
+            split=split,
+            oov_path=oov_path,
+        )
         for _, bldg_ds in gen:
             ds_list.append(bldg_ds)
     return ConcatDataset(ds_list)
@@ -50,7 +75,17 @@ def split_dataset(dataset, train_ratio, seed):
     return random_split(dataset, [n_train, n_val], generator=g)
 
 
-def build_datasets():
+def build_datasets(
+    context_len=168,
+    pred_len=24,
+    apply_scaler_transform="boxcox",
+    scaler_transform_path=Path(os.environ["BUILDINGS_BENCH"]) / "metadata/transforms",
+    weather_inputs=None,
+    split: str = "",  # '', 'train', 'test', 'val'
+    oov_path: Path | None = None,  # Path to oov.txt
+    oov_val: Path | None = None,  # === 修改点：显式给出两个 OOV
+    oov_test: Path | None = None,
+):
     # def collate(batch):
     #     out = {}
     #     for k in batch[0]:
@@ -64,16 +99,77 @@ def build_datasets():
     #             sub_ds.init_fp()
 
     # 900K 直接按官方划分
-    pretrain_train = load_pretraining("buildings-900k-train", **common_kwargs)
-    pretrain_val = load_pretraining("buildings-900k-val", **common_kwargs)
+    pretrain_train = load_pretraining(
+        "buildings-900k-train",
+        context_len=context_len,
+        pred_len=pred_len,
+        apply_scaler_transform=apply_scaler_transform,
+        scaler_transform_path=scaler_transform_path,
+        weather_inputs=weather_inputs,
+    )
+    pretrain_val = load_pretraining(
+        "buildings-900k-val",
+        context_len=context_len,
+        pred_len=pred_len,
+        apply_scaler_transform=apply_scaler_transform,
+        scaler_transform_path=scaler_transform_path,
+        weather_inputs=weather_inputs,
+    )
+    if split == "val":
+        oov_path = (
+            _merge_oov_files([oov_val, oov_test]) if oov_val and oov_test else None
+        )
+        custom_full_train = concat_all(
+            custom_registry,
+            context_len=context_len,
+            pred_len=pred_len,
+            apply_scaler_transform=apply_scaler_transform,
+            scaler_transform_path=scaler_transform_path,
+            weather_inputs=weather_inputs,
+            split="train",
+            oov_path=oov_path,
+        )
+        custom_full_val = concat_all(
+            custom_registry,
+            context_len=context_len,
+            pred_len=pred_len,
+            apply_scaler_transform=apply_scaler_transform,
+            scaler_transform_path=scaler_transform_path,
+            weather_inputs=weather_inputs,
+            split="test",
+            oov_path=oov_val,
+        )
+        custom_full_test = concat_all(
+            custom_registry,
+            context_len=context_len,
+            pred_len=pred_len,
+            apply_scaler_transform=apply_scaler_transform,
+            scaler_transform_path=scaler_transform_path,
+            weather_inputs=weather_inputs,
+            split="test",
+            oov_path=oov_test,
+        )
+        train_dataset = ConcatDataset([pretrain_train, custom_full_train])
+        val_dataset = ConcatDataset([custom_full_val])
+        test_dataset = ConcatDataset([pretrain_val, custom_full_test])
+    else:
 
-    custom_full = concat_all(custom_registry)
+        custom_full = concat_all(
+            custom_registry,
+            context_len=context_len,
+            pred_len=pred_len,
+            apply_scaler_transform=apply_scaler_transform,
+            scaler_transform_path=scaler_transform_path,
+            weather_inputs=weather_inputs,
+            split=split,
+            oov_path=oov_path,
+        )
 
-    # custom_train, custom_val = split_dataset(custom_full, TRAIN_VAL_RATIO, RANDOM_SEED)
+        # custom_train, custom_val = split_dataset(custom_full, TRAIN_VAL_RATIO, RANDOM_SEED)
 
-    # ------------- 最终训练 / 验证合集 -----------------
-    train_dataset = ConcatDataset([pretrain_train, custom_full])
-    val_dataset = ConcatDataset([pretrain_val])
+        # ------------- 最终训练 / 验证合集 -----------------
+        train_dataset = ConcatDataset([pretrain_train, custom_full])
+        val_dataset = ConcatDataset([pretrain_val])
 
     # train_loader = DataLoader(
     #     train_dataset,
@@ -96,6 +192,11 @@ def build_datasets():
 
     print(f"最终训练样本：{len(train_dataset):,}")
     print(f"最终验证样本：{len(val_dataset):,}")
+    if split == "val":
+        print(f"最终测试样本：{len(test_dataset):,}")
+
+    if split == "val":
+        return train_dataset, val_dataset, test_dataset
 
     return train_dataset, val_dataset
 

@@ -8,7 +8,7 @@ from buildings_bench.data.datasets import TorchBuildingDatasetFromParquet
 from buildings_bench.data.datasets import PandasBuildingDatasetsFromCSV
 from buildings_bench import BuildingTypes
 from buildings_bench import transforms
-from typing import List, Union
+from typing import Dict, List, Set, Union
 
 
 dataset_registry = [
@@ -59,8 +59,8 @@ def load_pretraining(
     name: str,
     num_buildings_ablation: int = -1,
     apply_scaler_transform: str = "",
-    scaler_transform_path: Path = None,
-    weather_inputs: List[str] = None,
+    scaler_transform_path: Path | None = None,
+    weather_inputs: List[str] | None = None,
     custom_idx_filename: str = "",
     context_len=168,  # week
     pred_len=24,
@@ -129,10 +129,13 @@ def load_torch_dataset(
     dataset_path: Path = None,
     apply_scaler_transform: str = "",
     scaler_transform_path: Path = None,
-    weather_inputs: List[str] = None,
+    weather_inputs: List[str] | None = None,
     include_outliers: bool = False,
     context_len=168,
     pred_len=24,
+    *,  # ⬅ 让新增参数只能用关键字调用，避免旧代码位置错位
+    split: str = "",  # '', 'train', 'test'
+    oov_path: Path | None = None,  # Path to oov.txt
 ) -> Union[TorchBuildingDatasetsFromCSV, TorchBuildingDatasetFromParquet]:
     r"""Load datasets by name.
 
@@ -150,6 +153,23 @@ def load_torch_dataset(
     Returns:
         dataset (Union[TorchBuildingDatasetsFromCSV, TorchBuildingDatasetFromParquet]): Dataset for benchmarking.
     """
+    # ---- 0) 参数检查 ---------------------------------------------------------
+    split = split.lower()
+    if split not in {"", "train", "test"}:
+        raise ValueError(f"split must be '', 'train' or 'test' (got '{split}')")
+    if split and not oov_path:
+        raise ValueError("When `split` is specified, `oov_path` must be given")
+
+    # ---- 1) 解析 oov.txt -----------------------------------------------------
+    oov_lookup: Dict[str, Set[str]] = {}
+    if oov_path:
+        with open(oov_path) as fp:
+            for line in fp:
+                if ":" not in line:
+                    continue
+                ds, bid = line.strip().lower().split(":", 1)
+                oov_lookup.setdefault(ds, set()).add(bid)
+
     if not dataset_path:
         dataset_path = Path(os.environ.get("BUILDINGS_BENCH", ""))
         if not dataset_path.exists():
@@ -157,6 +177,12 @@ def load_torch_dataset(
 
     with open(dataset_path / "metadata" / "benchmark.toml", "rb") as f:
         metadata = tomli.load(f)["buildings_bench"]
+
+    def get_oov_set(ds_name: str) -> Set[str]:
+        key = ds_name.lower()
+        if key.startswith("bdg-2"):  # 处理 bdg‑2 子集
+            key = "bdg-2"
+        return oov_lookup.get(key, set())
 
     if name.lower() == "buildings-900k-test":
         spatial_lookup = transforms.LatLonTransform()
@@ -197,14 +223,13 @@ def load_torch_dataset(
             leap_years=metadata["leap_years"],
         )
     elif ":" in name.lower():
-        name, subset = name.lower().split(":")
-        dataset_metadata = metadata[name.lower()]
-        all_by_files = parse_building_years_metadata(dataset_path, name.lower())
-        all_by_files = [
-            by_file for by_file in all_by_files if subset in by_file.lower()
-        ]
+        name_base, subset = name.lower().split(":")
+        dataset_metadata = metadata[name_base]
+        all_by_files = parse_building_years_metadata(dataset_path, name_base)
+        all_by_files = [bf for bf in all_by_files if subset in bf.lower()]
         if include_outliers:
             dataset_path = dataset_path / "buildingsbench_with_outliers"
+
         dataset_generator = TorchBuildingDatasetsFromCSV(
             dataset_path,
             all_by_files,
@@ -216,12 +241,16 @@ def load_torch_dataset(
             scaler_transform_path=scaler_transform_path,
             leap_years=metadata["leap_years"],
             weather_inputs=weather_inputs,
+            split=split,
+            oov_buildings=get_oov_set(name_base),
         )
     elif name.lower() in benchmark_registry:
-        dataset_metadata = metadata[name.lower()]
-        all_by_files = parse_building_years_metadata(dataset_path, name.lower())
+        name_base = name.lower()
+        dataset_metadata = metadata[name_base]
+        all_by_files = parse_building_years_metadata(dataset_path, name_base)
         if include_outliers:
             dataset_path = dataset_path / "buildingsbench_with_outliers"
+
         dataset_generator = TorchBuildingDatasetsFromCSV(
             dataset_path,
             all_by_files,
@@ -233,8 +262,9 @@ def load_torch_dataset(
             scaler_transform_path=scaler_transform_path,
             leap_years=metadata["leap_years"],
             weather_inputs=weather_inputs,
+            split=split,
+            oov_buildings=get_oov_set(name_base),
         )
-
     else:
         raise ValueError(f"Unknown dataset {name}")
 
@@ -305,3 +335,16 @@ def load_pandas_dataset(
         scaler_transform_path=scaler_transform_path,
         leap_years=metadata["leap_years"],
     )
+
+
+if __name__ == "__main__":
+    ds = load_torch_dataset(
+        "LCL",  # or "BDG-2:bear"
+        dataset_path=Path("/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench"),
+        context_len=168,
+        pred_len=24,
+        split="test",  # 'train'  | 'test' | ''
+        oov_path=Path("/home/hadoop/bec/oov.txt"),  # ← 你的 oov.txt
+    )
+
+    print(f"Loaded {len(ds)} buildings")

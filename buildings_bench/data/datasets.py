@@ -2,7 +2,7 @@ from pathlib import Path
 import torch
 import pandas as pd
 import numpy as np
-from typing import List, Union, Iterator, Tuple
+from typing import List, Set, Union, Iterator, Tuple
 import buildings_bench.transforms as transforms
 from buildings_bench.transforms import BoxCoxTransform, StandardScalerTransform
 from buildings_bench import BuildingTypes
@@ -290,6 +290,9 @@ class TorchBuildingDatasetsFromCSV:
         apply_scaler_transform: str = "",
         scaler_transform_path: Path = None,
         leap_years: List[int] = None,
+        *,  # 👈 新增关键字参数
+        split: str = "",  # '', 'train', 'test'
+        oov_buildings: Set[str] = None,
     ):
         """
         Args:
@@ -322,6 +325,9 @@ class TorchBuildingDatasetsFromCSV:
                     header=0,
                     parse_dates=True,
                 )
+        oov_buildings = {b.lower() for b in (oov_buildings or set())}
+        want_test = split == "test"
+        want_train = split == "train"
 
         for building_year_file in building_year_files:
             name = building_year_file.split("_")[0].split("/")[1]
@@ -355,6 +361,13 @@ class TorchBuildingDatasetsFromCSV:
 
             # for each bldg, create a TorchBuildingDatasetFromCSV
             for bldg_name, bldg_df in zip(bldg_names, dfs):
+                bldg_key = bldg_name.lower()
+                # ---------- 新增  train / test 过滤 ----------
+                if want_train and bldg_key in oov_buildings:
+                    continue  # 只留训练 ⇒ 跳过 OOV
+                if want_test and bldg_key not in oov_buildings:
+                    continue  # 只留测试 ⇒ 只保留 OOV
+
                 bldg_df.rename(columns={bldg_df.columns[0]: "power"}, inplace=True)
 
                 min_required = context_len + pred_len  # 最少要这么多行
