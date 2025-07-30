@@ -120,7 +120,13 @@ def main(args, model_args):
 
     # ----------------- 2.1 数据 -----------------
     if DATASET_FULL:
-        train_dataset, val_dataset = build_datasets()
+        train_dataset, val_dataset = build_datasets(
+            context_len=model_args["max_context_len"],
+            pred_len=model_args["max_pred_len"],
+            apply_scaler_transform=args.apply_scaler_transform,
+            split="train",
+            oov_path=Path("/home/hadoop/bec/oov.txt"),
+        )
     else:
         raise NotImplementedError("只展示 full-dataset 分支，mini 数据集同理")
 
@@ -387,7 +393,7 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--warmup_steps", type=int, default=20000)
-    p.add_argument("--train_tokens", type=int, default=1_000_000_000)
+    p.add_argument("--train_tokens", type=int, default=4_000_000_000)
     p.add_argument("--random_seed", type=int, default=99)
     p.add_argument("--resume_from_checkpoint", type=str, default="")
     p.add_argument("--note", type=str, default="")
@@ -430,7 +436,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--no_improve_steps",
         type=int,
-        default=20000,
+        default=100000,
         help="连续无 loss 改进达到该步数后：若非最后阶段则切课；若已是最后阶段则提前结束",
     )
     # ---------- 修改结束 --------------------------------
