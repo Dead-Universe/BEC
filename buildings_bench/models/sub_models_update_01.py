@@ -388,6 +388,7 @@ class Encoder(nn.Module):
 
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
+        self.ans_norm = RMSNorm(args.dim)
 
     def forward(
         self,
@@ -419,7 +420,7 @@ class Encoder(nn.Module):
         )
         y = src + h
         z = y + self.ffn(self.ffn_norm(y))
-        return z
+        return self.ans_norm(z)  # [B, S, D] 输出
 
 
 class Decoder(nn.Module):
@@ -453,6 +454,7 @@ class Decoder(nn.Module):
             embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
         )
         self.ffn_norm = RMSNorm(args.dim)
+        self.ans_norm = RMSNorm(args.dim)
 
     def forward(
         self,
@@ -505,7 +507,7 @@ class Decoder(nn.Module):
         )
         z = y + cross_out
         out = z + self.ffn(self.ffn_norm(z))
-        return out
+        return self.ans_norm(out)  # [B, S_tgt, D] 输出
 
 
 # ──────────────────────────────────────────────
