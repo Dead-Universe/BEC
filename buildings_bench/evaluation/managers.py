@@ -260,9 +260,9 @@ class DatasetMetricsManager:
     """
 
     default_metrics = (
-        metrics_factory("nrmse", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
-        + metrics_factory("nmbe", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
-        + metrics_factory("nmae", types=[MetricType.SCALAR, MetricType.HOUR_OF_DAY])
+        metrics_factory("nrmse", types=[MetricType.SCALAR])
+        + metrics_factory("nmbe", types=[MetricType.SCALAR])
+        + metrics_factory("nmae", types=[MetricType.SCALAR])
     )
 
     def __init__(

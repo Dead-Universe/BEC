@@ -155,6 +155,7 @@ import numpy as np
 from pathlib import Path
 from rliable import library as rly
 from buildings_bench.evaluation.managers import BuildingTypes
+import zlib
 
 
 def drop_extreme_iqr(
@@ -188,21 +189,72 @@ def drop_extreme_iqr(
     return df.loc[~mask_extreme].copy()
 
 
+def _ctx_seed(base_seed: int | None, *parts) -> int | None:
+    """根据上下文(parts)从 base_seed 派生一个稳定子种子；base_seed 为 None 则返回 None。"""
+    if base_seed is None:
+        return None
+    s = "|".join(str(p) for p in parts)
+    h = zlib.adler32(s.encode("utf-8")) & 0xFFFFFFFF
+    return (int(base_seed) ^ int(h)) % (2**32 - 1) or 1  # 避免 0
+
+
 def _aggregate_scores(
     df: pd.DataFrame,
-    aggregate: str = "median",
+    aggregate: str = "mean",
     reps: int = 50_000,
+    seed: int | None = 0,
+    sort_cols: tuple[str, ...] = (
+        "dataset",
+        "building_id",
+        "metric",
+        "metric_type",
+        "model",
+    ),
 ):
-    """给定同一 building_type & metric 的 DataFrame，计算聚合指标和 bootstrap 置信区间。"""
-    if aggregate == "median":
-        func = lambda x: np.array([np.median(x.reshape(-1))])
-    elif aggregate == "mean":
-        func = lambda x: np.array([np.mean(x.reshape(-1))])
-    else:
-        raise ValueError("aggregate must be 'median' or 'mean'")
+    """
+    给定同一 building_type & metric 的 DataFrame，计算聚合“均值/中位数”与 95% bootstrap CI（确定性）。
+    - 对每个 model 独立做 bootstrap；使用 np.random.default_rng(seed)。
+    - 行顺序用稳定排序固定，避免平台/读入差异导致的抖动。
+    返回：
+      agg_scores[m] -> shape (1,)
+      agg_cis[m]    -> shape (2,1)  # [lo, hi]^T
+    """
+    # 稳定排序，确保行顺序可复现
+    sort_cols = [c for c in sort_cols if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="mergesort").copy()
 
-    scores = {m: v.values.reshape(-1, 1) for m, v in df.groupby("model")["value"]}
-    agg_scores, agg_cis = rly.get_interval_estimates(scores, func, reps=reps)
+    # 选择聚合函数
+    if aggregate == "mean":
+        reduce_fn = np.mean
+    elif aggregate == "median":
+        reduce_fn = np.median
+    else:
+        raise ValueError("aggregate must be 'mean' or 'median'")
+
+    agg_scores, agg_cis = {}, {}
+
+    # 对每个模型独立抽样，避免不同 group 之间的顺序影响
+    for m, g in df.groupby("model", sort=False):
+        arr = g["value"].to_numpy(dtype=float).reshape(-1)
+        if arr.size == 0:
+            continue
+
+        point = reduce_fn(arr)
+
+        # 太少无法 bootstrap（<2），CI 置为 NaN，但仍返回点估计
+        if (reps <= 0) or (arr.size < 2):
+            lo = hi = np.nan
+        else:
+            rng = np.random.default_rng(seed)
+            # (reps, n) 的索引矩阵；对大 n 可改成分批以省内存
+            idx = rng.integers(0, arr.size, size=(reps, arr.size), endpoint=False)
+            boots = reduce_fn(arr[idx], axis=1)
+            lo, hi = np.percentile(boots, [2.5, 97.5])
+
+        agg_scores[m] = np.array([point], dtype=float)
+        agg_cis[m] = np.array([[lo, hi]], dtype=float).T  # (2,1)
+
     return agg_scores, agg_cis
 
 
@@ -338,29 +390,69 @@ def _aggregate_scores(
 #     return result_dict
 
 
+def _load_oov_allowlist(oov_file: str):
+    """
+    读取 oov.txt，返回两个集合：
+      - allow_pairs: {(dataset, building_id)}（全小写），用于非 BDG-2
+      - allow_bdg2_buildings: {building_id}（全小写），用于 BDG-2（仅按楼宇名匹配）
+    oov.txt 每行格式建议为:
+      DatasetName:BuildingID
+    BDG-2 行示例：
+      BDG-2:Bear_education_Marta
+    空行或以 '#' 开头的行会被忽略。
+    """
+    allow_pairs = set()
+    allow_bdg2_buildings = set()
+    for raw in Path(oov_file).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.lower()
+        # 允许两种格式：dataset:building 或 仅 building（仅在 BDG-2 下有用）
+        if ":" in line:
+            ds, bid = line.split(":", 1)
+            ds, bid = ds.strip(), bid.strip()
+            if ds == "bdg-2":
+                allow_bdg2_buildings.add(bid)
+            else:
+                allow_pairs.add((ds, bid))
+        else:
+            # 无数据集前缀，只能用于 BDG-2
+            allow_bdg2_buildings.add(line)
+    return allow_pairs, allow_bdg2_buildings
+
+
+def _dbg(tag, df):
+    print(f"[DBG] {tag}: n={len(df)}")
+
+
 def return_aggregate(
     model_list,
     results_dir,
     experiment="zero_shot",
     metrics=("cvrmse",),
-    aggregate="median",  # 'median' | 'mean'
+    aggregate="mean",  # 固定为均值
     exclude_simulated=True,
     only_simulated=False,
-    oov_list=(),
+    oov_list=(),  # 兼容旧参数：若提供且 oov_file=None，仍按“排除”逻辑
+    oov_file=None,  # 新增：白名单文件路径；若提供，则仅保留文件中列出的楼宇
     reps=50_000,
+    seed: int | None = 0,  # 新增：全局种子；None 表示保持随机
 ):
     """
-    计算指定模型在不同 building_type / metric / dataset 下的聚合（均值或中位数）及 95% bootstrap CI。
-    - 遇到 `inf` / `nan` 会打印详细警告并删除对应行，避免最终结果为 `nan`。
-
-    Returns
-    -------
-    result_dict : dict
-        result_dict[building_type][metric][dataset_tag][model] = (score, [lo, hi])
-        其中 dataset_tag == "_overall" 表示跨数据集总体结果。
+    计算指定模型在不同 building_type / metric / dataset 下的均值及 95% bootstrap CI。
+    - 如果提供 oov_file：只保留 oov.txt 中列出的楼宇（区分逻辑：BDG-2 只按楼宇名匹配）。
+    - 如果 oov_file 为 None：全部计算；若 oov_list 非空，按原逻辑“排除”匹配项。
+    - 遇到 `inf` / `nan` 会打印警告并删除对应行。
     """
-    metrics = list(set(metrics))
+    metrics = list(set(m.lower() for m in metrics))
     BTYPES = [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]
+
+    # 读取 oov 白名单
+    allow_pairs, allow_bdg2_buildings = (set(), set())
+    use_allowlist = oov_file is not None
+    if use_allowlist:
+        allow_pairs, allow_bdg2_buildings = _load_oov_allowlist(oov_file)
 
     result_dict = {bt: {m: {} for m in metrics} for bt in BTYPES}
 
@@ -386,10 +478,52 @@ def return_aggregate(
                 df = load_csv(prefix, model)
                 df["model"] = model
 
-                # ----------- 基础过滤 ----------- #
-                if oov_list:
-                    df = df[~df["building_id"].str.contains("|".join(oov_list))]
+                # ----------- 统一小写 ----------- #
+                for col in (
+                    "dataset",
+                    "building_id",
+                    "building_type",
+                    "metric",
+                    "metric_type",
+                ):
+                    if col in df.columns and df[col].dtype == object:
+                        df[col] = df[col].str.lower().str.strip()
 
+                # ----------- OOV 白名单（仅保留） ----------- #
+                if use_allowlist:
+                    # BDG-2：dataset 以 "bdg-2" 开头的，只按 building_id 白名单保留
+                    is_bdg2 = df["dataset"].str.startswith("bdg-2", na=False)
+                    keep_bdg2 = is_bdg2 & df["building_id"].isin(allow_bdg2_buildings)
+
+                    # 非 BDG-2：按 (dataset, building_id) 成对匹配
+                    pair_series = (
+                        df["dataset"].fillna("") + ":" + df["building_id"].fillna("")
+                    )
+                    keep_non = (~is_bdg2) & pair_series.isin(
+                        {f"{d}:{b}" for d, b in allow_pairs}
+                    )
+
+                    old_df_len = len(df)
+
+                    df = df[keep_bdg2 | keep_non]
+
+                    if len(df) < old_df_len:
+                        print(
+                            f"[INFO] {model} ({bt}-{metric}) dropped "
+                            f"{old_df_len - len(df)} OOV buildings."
+                        )
+
+                    if df.empty:
+                        continue
+                if oov_list:
+                    # 旧逻辑：排除包含这些子串的楼宇（大小写已统一）
+                    df = df[
+                        ~df["building_id"].str.contains(
+                            "|".join([s.lower() for s in oov_list])
+                        )
+                    ]
+
+                # ----------- 模拟数据过滤 ----------- #
                 if exclude_simulated:
                     df = df[
                         ~df["dataset"].isin(
@@ -401,15 +535,16 @@ def return_aggregate(
                         df["dataset"].isin({"buildings-900k-test", "buildings-1m-test"})
                     ]
 
-                # 只保留当前 metric
+                # ----------- 只保留当前 metric（标量口径）----------- #
                 if metric not in ("rps", "crps"):
+                    # df = df[(df["metric"] == metric) & (df["metric_type"] == "scalar")]
                     cond = (df["metric"] == metric) | df["metric"].str.startswith(
                         metric + "_"
                     )
                     df = df[cond]
 
-                # 只保留当前 building_type
-                df = df[df["building_type"] == bt]
+                # ----------- 只保留当前 building_type ----------- #
+                df = df[df["building_type"] == bt]  # bt 本身就是标准小写
 
                 # ----------- inf / nan 处理 ----------- #
                 n_nan = df["value"].isna().sum()
@@ -422,7 +557,8 @@ def return_aggregate(
                 df["value"] = df["value"].replace(np.inf, np.nan)
                 df = df.dropna(subset=["value"])
 
-                concat_dfs.append(df)
+                if not df.empty:
+                    concat_dfs.append(df)
 
             # 合并所有模型数据用于整体聚合
             all_df = (
@@ -434,7 +570,10 @@ def return_aggregate(
             # ---- (1) 总体聚合 ---- #
             result_dict[bt][metric]["_overall"] = {}
             if not all_df.empty:
-                overall_scores, overall_cis = _aggregate_scores(all_df, aggregate, reps)
+                seed_overall = _ctx_seed(seed, bt, metric, "_overall")
+                overall_scores, overall_cis = _aggregate_scores(
+                    all_df, aggregate=aggregate, reps=reps, seed=seed_overall
+                )
                 for m in model_list:
                     if m in overall_scores:
                         result_dict[bt][metric]["_overall"][m] = (
@@ -447,8 +586,13 @@ def return_aggregate(
                         )
 
             # ---- (2) 按 dataset 聚合 ---- #
+            if all_df.empty or "dataset" not in all_df.columns:
+                continue  # 无 dataset 列或无数据，跳过
             for dname, sub_df in all_df.groupby("dataset"):
-                ds_scores, ds_cis = _aggregate_scores(sub_df, aggregate, reps)
+                seed_ds = _ctx_seed(seed, bt, metric, dname)
+                ds_scores, ds_cis = _aggregate_scores(
+                    sub_df, aggregate=aggregate, reps=reps, seed=seed_ds
+                )
                 result_dict[bt][metric][dname] = {}
                 for m in model_list:
                     if m in ds_scores:
@@ -489,7 +633,7 @@ if __name__ == "__main__":
     import os
 
     results_dir = "/home/hadoop/bec/BuildingsBench/results"
-    models = ["timemoe", "TransformerWithGaussianAndMoEs-L-dataset-full"]
+    models = ["timemoe:168_12"]
 
     oov = []  # ← 你的 oov 列表
     with open(Path(os.environ["BUILDINGS_BENCH"]) / "metadata" / "oov.txt") as f:
@@ -501,10 +645,11 @@ if __name__ == "__main__":
         results_dir,
         experiment="zero_shot",
         metrics=["nrmse", "nmae"],
-        aggregate="median",
+        aggregate="mean",
         oov_list=oov,
+        oov_file="/home/hadoop/bec/BuildingsBench/oov_test.txt",
     )
-    pretty_print(res_med, aggregate="median")
+    pretty_print(res_med, aggregate="mean")
 
     # ---- ② 全局均值 + dataset 均值 ----
     res_mean = return_aggregate(
@@ -514,5 +659,6 @@ if __name__ == "__main__":
         metrics=["nrmse", "nmae"],
         aggregate="mean",
         oov_list=oov,
+        # oov_file="/home/hadoop/bec/BuildingsBench/oov_test.txt",
     )
     pretty_print(res_mean, aggregate="mean")
