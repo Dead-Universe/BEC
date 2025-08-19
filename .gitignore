@@ -14,3 +14,4 @@ hpc/
 scratch/
 tutorials/.ipynb_checkpoints/
 dev/
+logs/
