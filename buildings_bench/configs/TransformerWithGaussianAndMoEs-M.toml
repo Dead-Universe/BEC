@@ -1,26 +1,27 @@
 [model]
 context_len = 168
 pred_len = 24
-num_encoder_layers = 6
-num_decoder_layers = 3
+num_encoder_layers = 4
+num_decoder_layers = 4
 nhead = 8
-dim_feedforward = 2048
+dim_feedforward = 1024
 d_model = 512
 dropout = 0.0
 activation = 'gelu'
 continuous_loads = true
 ignore_spatial = false
-continuous_head = 'gaussian_nll'
+continuous_head = 'mse'
 num_experts = 8
 top_k = 2
-aux_loss_weight = 0.01
+# aux_loss_weight = 0.01
 
 [pretrain]
-batch_size = 64
+name = 'TransformerWithGaussianAndMoEs-M-Update-09'
+batch_size = 1024
 init_scale = 0.02
-warmup_steps = 10000
+warmup_steps = 20000
 lr = 0.00006
-train_tokens = 1000000000
+train_tokens = 8000000000
 apply_scaler_transform = 'boxcox'
 
 [zero_shot]

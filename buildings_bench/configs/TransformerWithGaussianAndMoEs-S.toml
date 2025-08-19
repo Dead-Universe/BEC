@@ -1,6 +1,8 @@
 [model]
 context_len = 168
 pred_len = 24
+max_context_len = 336
+max_pred_len = 168
 num_encoder_layers = 2
 num_decoder_layers = 2
 nhead = 4
@@ -10,7 +12,7 @@ dropout = 0.0
 # activation = 'gelu'
 continuous_loads = true
 ignore_spatial = false
-continuous_head = 'gaussian_nll'
+continuous_head = 'huber'
 num_experts = 4
 top_k = 2
 # aux_loss_weight = 0.01
@@ -18,13 +20,13 @@ top_k = 2
 # experts_per_gp = 2
 
 [pretrain]
-name = 'TransformerWithGaussianAndMoEs-S-Update-01'
-batch_size = 2048
+batch_size = 512
 init_scale = 0.02
-warmup_steps = 1250
+warmup_steps = 10000
 lr = 0.00006
-train_tokens = 1000000000
+train_tokens = 4000000000
 apply_scaler_transform = 'boxcox'
+note = "Update-15-huber"
 
 [zero_shot]
 apply_scaler_transform = 'boxcox'

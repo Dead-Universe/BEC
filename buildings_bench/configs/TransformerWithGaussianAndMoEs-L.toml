@@ -4,7 +4,7 @@ pred_len = 24
 max_context_len = 336
 max_pred_len = 168
 num_encoder_layers = 6
-num_decoder_layers = 9
+num_decoder_layers = 8
 nhead = 12
 dim_feedforward = 2048
 d_model = 768
@@ -21,10 +21,10 @@ top_k = 2
 batch_size = 32
 init_scale = 0.02
 warmup_steps = 20000
-lr = 0.00003
+lr = 0.00006
 train_tokens = 4000000000
 apply_scaler_transform = 'boxcox'
-note = "Update-15-huber"
+note = "Update-19-huber"
 
 [zero_shot]
 batch_size = 2048

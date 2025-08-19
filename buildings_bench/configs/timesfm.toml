@@ -4,9 +4,9 @@ continuous_loads = true
 
 [zero_shot]
 # 滑窗长度
-context_len = 168
+# context_len = 168
 # 预测步长
-forecast_horizon = 24
+# forecast_horizon = 24
 # pandas 频率字符串，sktime/TimesFM 里可以按需要改
 freq = "H"
 ignore_scoring_rules = true

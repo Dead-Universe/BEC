@@ -5,8 +5,8 @@ continuous_loads = true
 [zero_shot]
 model_name = 'Maple728/TimeMoE-200M'
 # 滑窗长度
-context_len = 168
+# context_len = 168
 # 预测步长
-forecast_horizon = 24
+# forecast_horizon = 24
 
 ignore_scoring_rules = true
