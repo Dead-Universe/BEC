@@ -116,11 +116,13 @@ class LoadForecastingTransformerMoE(BaseModel):
             trend_dec_layer, num_decoder_layers // 2
         )
 
+        self.continuous_head = continuous_head
         # 6) 预测头
-        out_dim = 1 if continuous_head == "mse" else 2
+        out_dim = (
+            1 if self.continuous_head == "mse" or self.continuous_head == "huber" else 2
+        )
         self.seasonal_head = nn.Linear(d_model, out_dim)
         self.trend_head = nn.Linear(d_model, out_dim)
-        self.continuous_head = continuous_head
 
         # 7) 解码查询向量
         self.query_embed = nn.Embedding(pred_len, d_model)
@@ -167,18 +169,25 @@ class LoadForecastingTransformerMoE(BaseModel):
     # ------------------------------------------------------------------
     # loss / predict / finetune helper 与原实现几乎一致
     # ------------------------------------------------------------------
-    def loss(self, pred, y):
+    def loss(self, pred: torch.Tensor, y: torch.Tensor):
         """
-        task loss only (aux loss 已移除)  pred:[B, pred_len, ...]
+        pred : [B, pred_len, out_dim]   (out_dim = 1 或 2)
+        y    : [B, pred_len, 1]
         """
-        if self.continuous_loads and self.continuous_head == "mse":
-            return F.mse_loss(pred, y)
-        elif self.continuous_loads and self.continuous_head == "gaussian_nll":
-            return F.gaussian_nll_loss(
-                pred[:, :, 0].unsqueeze(2),
-                y,
-                F.softplus(pred[:, :, 1].unsqueeze(2)) ** 2,
-            )
+        if self.continuous_loads:
+            if self.continuous_head == "huber":
+                # delta(=β) 控制 MSE ↔ MAE 过渡区间，常用 1.0
+                return F.huber_loss(pred, y, delta=1.0)  # PyTorch ≥ 1.13
+                # 若你的版本较旧，请改用:
+                # return F.smooth_l1_loss(pred, y, beta=1.0)
+            elif self.continuous_head == "mse":
+                return F.mse_loss(pred, y)
+            elif self.continuous_head == "gaussian_nll":
+                return F.gaussian_nll_loss(
+                    pred[:, :, 0].unsqueeze(2),
+                    y,
+                    F.softplus(pred[:, :, 1].unsqueeze(2)) ** 2,
+                )
         else:
             return F.cross_entropy(
                 pred.reshape(-1, self.vocab_size), y.long().reshape(-1)
@@ -217,7 +226,7 @@ class LoadForecastingTransformerMoE(BaseModel):
     def predict(
         self,
         x: Dict,
-        postprocess: bool = True,
+        postprocess: bool = False,
         clamp_q: tuple = (0.01, 0.99),
         smooth_kernel: int = 3,
     ):
@@ -229,7 +238,9 @@ class LoadForecastingTransformerMoE(BaseModel):
 
         # 取 point 预测 (与旧逻辑一致)
         pred_point = (
-            ans if self.continuous_head == "mse" else ans[:, :, 0].unsqueeze(-1)
+            ans
+            if self.continuous_head == "mse" or self.continuous_head == "huber"
+            else ans[:, :, 0].unsqueeze(-1)
         )  # 只取 μ
 
         # 后处理
@@ -259,72 +270,173 @@ class LoadForecastingTransformerMoE(BaseModel):
             else:
                 new_state_dict[k] = v
         self.load_state_dict(new_state_dict)
-        # print(f"Loaded model checkpoint from {checkpoint_path}...")
+        print(f"Loaded model checkpoint from {checkpoint_path}...")
 
 
 # ----------------------------------------------------------------------
 # Quick sanity-check
 # ----------------------------------------------------------------------
+# if __name__ == "__main__":
+#     torch.manual_seed(0)
+#     # 模型配置
+#     cfg = dict(
+#         context_len=168,
+#         pred_len=24,
+#         num_encoder_layers=2,
+#         num_decoder_layers=2,
+#         d_model=256,
+#         dim_feedforward=1024,
+#         num_experts=2,
+#         top_k=2,
+#         nhead=8,
+#         dropout=0.0,
+#         continuous_loads=True,
+#         continuous_head="huber",
+#     )
+
+#     # 创建模型
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+#     model = LoadForecastingTransformerMoE(**cfg).to(device).train()
+
+#     # 创建假数据 (B=2, T=192: 168 + 24)
+#     B = 2
+#     T = cfg["context_len"] + cfg["pred_len"]
+
+#     dummy = {
+#         "latitude": torch.rand(B, T, 1, device=device) * 2 - 1,
+#         "longitude": torch.rand(B, T, 1, device=device) * 2 - 1,
+#         "building_type": torch.zeros(B, T, 1, dtype=torch.long, device=device),
+#         "day_of_year": torch.rand(B, T, 1, device=device) * 2 - 1,
+#         "day_of_week": torch.rand(B, T, 1, device=device) * 2 - 1,
+#         "hour_of_day": torch.rand(B, T, 1, device=device) * 2 - 1,
+#         "load": torch.rand(B, T, 1, device=device),
+#     }
+#     target = dummy["load"][:, -cfg["pred_len"] :, :]
+
+#     out = model(dummy)
+#     loss = model.loss(out, target)
+#     loss.backward()
+
+#     print("sanity-check OK – loss:", float(loss))
+
+#     dummy_input = {
+#         "latitude": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的纬度
+#         "longitude": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的经度
+#         "building_type": torch.zeros(
+#             B, T, 1, dtype=torch.long, device=device
+#         ),  # 假设的建筑类型
+#         "day_of_year": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的日期
+#         "day_of_week": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的星期几
+#         "hour_of_day": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的小时
+#         "load": torch.rand(B, T, 1, device=device),  # 假设的负荷数据
+#     }
+
+#     # 调用模型的predict方法
+#     model.eval()  # 设置为评估模式
+#     predictions, a = model.predict(dummy_input)
+
+#     # 输出结果
+#     print("Predictions Shape:", predictions.shape)
+#     print("Predictions:", predictions)
+#     print("Distribution Parameters:", a)
+
+
+# ----------------------------------------------------------------------
+# minimal_demo.py  ——  main 入口
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    # 模型配置
+    import os
+    from pathlib import Path
+    import pandas as pd
+    import torch
+
+    # ───────────────────────────────────────────
+    # Ⅰ. 读 CSV（最后 168+24=192 行）
+    # ───────────────────────────────────────────
+    CSV_PATH = "/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench/SMART/HomeG_clean=2016.csv"
+    df = (
+        pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
+        .sort_values("timestamp")
+        .iloc[-192:]
+    )
+
+    y_raw = df["power"].values.astype("float32")  # (192,)
+
+    # ───────────────────────────────────────────
+    # Ⅱ. Box‑Cox 归一化
+    # ───────────────────────────────────────────
+    from buildings_bench.transforms import BoxCoxTransform
+
+    boxcox = BoxCoxTransform()
+    transform_dir = (
+        Path(
+            os.environ.get(
+                "BUILDINGS_BENCH",
+                "/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench",
+            )
+        )
+        / "metadata"
+        / "transforms"
+    )
+    boxcox.load(transform_dir)
+
+    y_norm = torch.from_numpy(boxcox.transform(y_raw))  # tensor (192,)
+
+    # quick sanity…往返误差应极小
+    rt_diff = (torch.from_numpy(y_raw) - boxcox.undo_transform(y_norm)).abs().max()
+    print(f"↔ Box‑Cox round‑trip max|diff|: {rt_diff:.3e}")
+
+    # ───────────────────────────────────────────
+    # Ⅲ. 打包模型输入 [B=1, T=192, 1]
+    # ───────────────────────────────────────────
+    sample = {"load": y_norm.unsqueeze(0).unsqueeze(-1)}  # (1,192,1)
+    y_true_raw = y_raw[-24:]
+
+    # ───────────────────────────────────────────
+    # Ⅳ. 载入模型与权重
+    # ───────────────────────────────────────────
+
     cfg = dict(
         context_len=168,
         pred_len=24,
-        num_encoder_layers=2,
-        num_decoder_layers=2,
-        d_model=256,
-        dim_feedforward=1024,
-        num_experts=2,
+        num_encoder_layers=6,
+        num_decoder_layers=8,
+        d_model=768,
+        dim_feedforward=2048,
+        num_experts=8,
         top_k=2,
-        nhead=8,
+        nhead=12,
         dropout=0.0,
         continuous_loads=True,
-        continuous_head="gaussian_nll",
+        continuous_head="huber",
     )
 
-    # 创建模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = LoadForecastingTransformerMoE(**cfg).to(device).train()
+    model = LoadForecastingTransformerMoE(**cfg).to(device).eval()
 
-    # 创建假数据 (B=2, T=192: 168 + 24)
-    B = 2
-    T = cfg["context_len"] + cfg["pred_len"]
+    CKPT = "/home/hadoop/bec/BuildingsBench/checkpoints/TransformerWithGaussianAndMoEs-L_best_train.pt"
+    if not os.path.exists(CKPT):
+        raise FileNotFoundError(f"Checkpoint not found: {CKPT}")
+    model.load_from_checkpoint(CKPT)
+    print(f"✅ Loaded checkpoint: {CKPT}")
 
-    dummy = {
-        "latitude": torch.rand(B, T, 1, device=device) * 2 - 1,
-        "longitude": torch.rand(B, T, 1, device=device) * 2 - 1,
-        "building_type": torch.zeros(B, T, 1, dtype=torch.long, device=device),
-        "day_of_year": torch.rand(B, T, 1, device=device) * 2 - 1,
-        "day_of_week": torch.rand(B, T, 1, device=device) * 2 - 1,
-        "hour_of_day": torch.rand(B, T, 1, device=device) * 2 - 1,
-        "load": torch.rand(B, T, 1, device=device),
-    }
-    target = dummy["load"][:, -cfg["pred_len"] :, :]
+    # ───────────────────────────────────────────
+    # Ⅴ. 推断 & 反归一化
+    # ───────────────────────────────────────────
+    with torch.no_grad():
+        pred_norm, _ = model.predict(
+            {k: v.to(device) for k, v in sample.items()}, postprocess=False
+        )  # (1,24,1)
 
-    out = model(dummy)
-    loss = model.loss(out, target)
-    loss.backward()
+    pred_raw = boxcox.undo_transform(pred_norm.cpu()).squeeze()  # (24,)
 
-    print("sanity-check OK – loss:", float(loss))
-
-    dummy_input = {
-        "latitude": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的纬度
-        "longitude": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的经度
-        "building_type": torch.zeros(
-            B, T, 1, dtype=torch.long, device=device
-        ),  # 假设的建筑类型
-        "day_of_year": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的日期
-        "day_of_week": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的星期几
-        "hour_of_day": torch.rand(B, T, 1, device=device) * 2 - 1,  # 假设的小时
-        "load": torch.rand(B, T, 1, device=device),  # 假设的负荷数据
-    }
-
-    # 调用模型的predict方法
-    model.eval()  # 设置为评估模式
-    predictions, a = model.predict(dummy_input)
-
-    # 输出结果
-    print("Predictions Shape:", predictions.shape)
-    print("Predictions:", predictions)
-    print("Distribution Parameters:", a)
+    # ───────────────────────────────────────────
+    # Ⅵ. 打印结果
+    # ───────────────────────────────────────────
+    print("\n=== 24‑hour Forecast vs Truth (kW) ===")
+    print(" idx |  predict |   actual")
+    print("-----+----------+----------")
+    for i, (p_pred, p_true) in enumerate(zip(pred_raw, y_true_raw), 1):
+        # p_pred 可能是 0‑维 tensor；p_true 一定是 float
+        p_val = float(p_pred) if isinstance(p_pred, torch.Tensor) else p_pred
+        print(f" t+{i:02d} | {p_val:8.5f} | {p_true:8.5f}")
