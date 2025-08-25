@@ -63,6 +63,8 @@ class LoadForecastingTransformerMoE(BaseModel):
             use_dense=use_dense,
         )
 
+        self.use_dense = use_dense
+
         enc_layer = Encoder(self.cfg.n_dense_layers, self.cfg)
         self.encoder = nn.TransformerEncoder(
             enc_layer, num_encoder_layers + 2, enable_nested_tensor=False
@@ -114,14 +116,17 @@ class LoadForecastingTransformerMoE(BaseModel):
 
     # --------------------- loss（已移除分解正则） ---------------------
     def loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # 门控均衡辅助项
-        aux_loss = load_balancing_loss_func(
-            gate_logits=tuple(self._gate_logits),
-            top_k=self.cfg.n_activated_experts,
-            num_experts=self.cfg.n_routed_experts,
-            attention_mask=None,
-        )
-        self._gate_logits.clear()
+        if self.use_dense:
+            aux_loss = torch.tensor(0.0, device=pred.device)
+        else:
+            # 门控均衡辅助项
+            aux_loss = load_balancing_loss_func(
+                gate_logits=tuple(self._gate_logits),
+                top_k=self.cfg.n_activated_experts,
+                num_experts=self.cfg.n_routed_experts,
+                attention_mask=None,
+            )
+            self._gate_logits.clear()
 
         if self.continuous_loads:
             if self.continuous_head == "huber":
