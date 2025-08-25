@@ -448,6 +448,7 @@ def main(args, model_args):
     scaler = torch.amp.GradScaler()
 
     best_val_loss = float("inf")
+    best_train_loss = float("inf")
 
     #################### Resume from checkpoint ####################
 
@@ -512,6 +513,23 @@ def main(args, model_args):
         step += 1
 
         ppl = torch.exp(batch_loss.detach())
+
+        if args.rank == 0:
+            if best_train_loss > batch_loss.item():
+                best_train_loss = batch_loss.item()
+                model_name = checkpoint_name + "_best_train.pt"
+                utils.save_model_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    step,
+                    best_train_loss,
+                    checkpoint_dir / model_name,
+                )
+                print(
+                    f"rank {args.rank} step {step} saved best train model to {model_name}",
+                    flush=True,
+                )
 
         if args.rank == 0 and step % 500 == 0:
             # wandb.log(
@@ -598,136 +616,136 @@ def main(args, model_args):
                 # 一次性记录所有子指标
                 swanlab.log(metrics, step=step)
 
-        if args.rank == 0 and step % 1000 == 0:
-            print(
-                f"rank {args.rank} step {step} loss {batch_loss:.5f} "
-                f"ppl {ppl:.5f} seen_tokens {seen_tokens / 1000000:.2f}M "
-                f"in {(secs_per_step):.2f} seconds",
-                flush=True,
-            )
+        # if args.rank == 0 and step % 1000 == 0:
+        #     print(
+        #         f"rank {args.rank} step {step} loss {batch_loss:.5f} "
+        #         f"ppl {ppl:.5f} seen_tokens {seen_tokens / 1000000:.2f}M "
+        #         f"in {(secs_per_step):.2f} seconds",
+        #         flush=True,
+        #     )
 
-        if args.rank == 0 and step % 4000 == 0:
-            start_time = timer()
-            print(f"started validation at step {step}...")
+        # if args.rank == 0 and step % 4000 == 0:
+        #     start_time = timer()
+        #     print(f"started validation at step {step}...")
 
-            val_loss, val_ppl, val_metrics = validation(
-                model,
-                val_dataloader,
-                args,
-                loss,
-                load_transform,
-                transform,
-                inverse_transform,
-                predict,
-            )
+        #     val_loss, val_ppl, val_metrics = validation(
+        #         model,
+        #         val_dataloader,
+        #         args,
+        #         loss,
+        #         load_transform,
+        #         transform,
+        #         inverse_transform,
+        #         predict,
+        #     )
 
-            end_time = timer()
-            secs_per_step = end_time - start_time
-            print(
-                f"finished validation at step {step} with loss {val_loss:.5f} "
-                f"and ppl {val_ppl:.5f} in {(secs_per_step/60):.2f} minutes",
-                flush=True,
-            )
-            # only rank 0 needs to save model
-            if val_loss < best_val_loss:
+        #     end_time = timer()
+        #     secs_per_step = end_time - start_time
+        #     print(
+        #         f"finished validation at step {step} with loss {val_loss:.5f} "
+        #         f"and ppl {val_ppl:.5f} in {(secs_per_step/60):.2f} minutes",
+        #         flush=True,
+        #     )
+        #     # only rank 0 needs to save model
+        #     if val_loss < best_val_loss:
 
-                best_val_loss = val_loss
+        #         best_val_loss = val_loss
 
-                model_name = checkpoint_name + "_best.pt"
+        #         model_name = checkpoint_name + "_best.pt"
 
-                # delete previous
-                if (checkpoint_dir / model_name).exists():
-                    Path(checkpoint_dir / model_name).unlink()
-                # save best
-                utils.save_model_checkpoint(
-                    model,
-                    optimizer,
-                    scheduler,
-                    step,
-                    best_val_loss,
-                    checkpoint_dir / model_name,
-                )
+        #         # delete previous
+        #         if (checkpoint_dir / model_name).exists():
+        #             Path(checkpoint_dir / model_name).unlink()
+        #         # save best
+        #         utils.save_model_checkpoint(
+        #             model,
+        #             optimizer,
+        #             scheduler,
+        #             step,
+        #             best_val_loss,
+        #             checkpoint_dir / model_name,
+        #         )
 
-            # we always save the last val model
-            last_model_name = checkpoint_name + "_last.pt"
-            utils.save_model_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                step,
-                best_val_loss,
-                checkpoint_dir / last_model_name,
-            )
+        #     # we always save the last val model
+        #     last_model_name = checkpoint_name + "_last.pt"
+        #     utils.save_model_checkpoint(
+        #         model,
+        #         optimizer,
+        #         scheduler,
+        #         step,
+        #         best_val_loss,
+        #         checkpoint_dir / last_model_name,
+        #     )
 
-            for building_type in [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]:
-                for metric_name, metric_result in val_metrics[building_type].items():
-                    if metric_result.type == MetricType.SCALAR:
-                        # wandb.log(
-                        #     {f"val/{building_type}/{metric_name}": metric_result.value},
-                        #     step=step,
-                        # )
-                        swanlab.log(
-                            {f"val/{building_type}/{metric_name}": metric_result.value},
-                            step=step,
-                        )
-                    else:
-                        multi_hour_value = metric_result.value
-                        # Create a wandb.Table for each hour of day metric then plot a line plot
-                        # table = wandb.Table(columns=["time (hour)", metric_name])
+        #     for building_type in [BuildingTypes.RESIDENTIAL, BuildingTypes.COMMERCIAL]:
+        #         for metric_name, metric_result in val_metrics[building_type].items():
+        #             if metric_result.type == MetricType.SCALAR:
+        #                 # wandb.log(
+        #                 #     {f"val/{building_type}/{metric_name}": metric_result.value},
+        #                 #     step=step,
+        #                 # )
+        #                 swanlab.log(
+        #                     {f"val/{building_type}/{metric_name}": metric_result.value},
+        #                     step=step,
+        #                 )
+        #             else:
+        #                 multi_hour_value = metric_result.value
+        #                 # Create a wandb.Table for each hour of day metric then plot a line plot
+        #                 # table = wandb.Table(columns=["time (hour)", metric_name])
 
-                        # for row_idx in range(multi_hour_value.shape[0]):
-                        #     table.add_data(row_idx, multi_hour_value[row_idx].item())
-                        # wandb.log(
-                        #     {
-                        #         f"val/{building_type}/{metric_name}": wandb.plot.line(
-                        #             table,
-                        #             "time (hour)",
-                        #             metric_name,
-                        #             title=f"Time vs {metric_name}",
-                        #         )
-                        #     },
-                        #     step=step,
-                        # )
+        #                 # for row_idx in range(multi_hour_value.shape[0]):
+        #                 #     table.add_data(row_idx, multi_hour_value[row_idx].item())
+        #                 # wandb.log(
+        #                 #     {
+        #                 #         f"val/{building_type}/{metric_name}": wandb.plot.line(
+        #                 #             table,
+        #                 #             "time (hour)",
+        #                 #             metric_name,
+        #                 #             title=f"Time vs {metric_name}",
+        #                 #         )
+        #                 #     },
+        #                 #     step=step,
+        #                 # )
 
-                        hours = list(
-                            range(multi_hour_value.shape[0])
-                        )  # 生成小时序列 [0, 1, ..., N-1]
-                        values = [x.item() for x in multi_hour_value]  # 提取指标值列表
+        #                 hours = list(
+        #                     range(multi_hour_value.shape[0])
+        #                 )  # 生成小时序列 [0, 1, ..., N-1]
+        #                 values = [x.item() for x in multi_hour_value]  # 提取指标值列表
 
-                        from pyecharts import options as opts
+        #                 from pyecharts import options as opts
 
-                        # 创建 pyecharts 折线图对象
-                        line = swanlab.echarts.Line()
-                        line.add_xaxis(hours)  # X轴：时间（小时）
-                        line.add_yaxis(metric_name, values)  # Y轴：指标值
+        #                 # 创建 pyecharts 折线图对象
+        #                 line = swanlab.echarts.Line()
+        #                 line.add_xaxis(hours)  # X轴：时间（小时）
+        #                 line.add_yaxis(metric_name, values)  # Y轴：指标值
 
-                        # 设置图表标题和坐标轴标签
-                        line.set_global_opts(
-                            title_opts=opts.TitleOpts(title=f"Time vs {metric_name}"),
-                            xaxis_opts=opts.AxisOpts(name="time (hour)"),
-                            yaxis_opts=opts.AxisOpts(name=metric_name),
-                        )
+        #                 # 设置图表标题和坐标轴标签
+        #                 line.set_global_opts(
+        #                     title_opts=opts.TitleOpts(title=f"Time vs {metric_name}"),
+        #                     xaxis_opts=opts.AxisOpts(name="time (hour)"),
+        #                     yaxis_opts=opts.AxisOpts(name=metric_name),
+        #                 )
 
-                        # 记录到 SwanLab（指定分类和步骤）
-                        swanlab.log(
-                            {f"val/{building_type}/{metric_name}": line}, step=step
-                        )
+        #                 # 记录到 SwanLab（指定分类和步骤）
+        #                 swanlab.log(
+        #                     {f"val/{building_type}/{metric_name}": line}, step=step
+        #                 )
 
-            # wandb.log(
-            #     {
-            #         "val/loss": val_loss,
-            #         "val/ppl": val_ppl,
-            #     },
-            #     step=step,
-            # )
-            swanlab.log(
-                {
-                    "val/loss": val_loss,
-                    "val/ppl": val_ppl,
-                },
-                step=step,
-            )
-            print(f"finished validation with loss {val_loss:.5f} at step {step}...")
+        #     # wandb.log(
+        #     #     {
+        #     #         "val/loss": val_loss,
+        #     #         "val/ppl": val_ppl,
+        #     #     },
+        #     #     step=step,
+        #     # )
+        #     swanlab.log(
+        #         {
+        #             "val/loss": val_loss,
+        #             "val/ppl": val_ppl,
+        #         },
+        #         step=step,
+        #     )
+        #     print(f"finished validation with loss {val_loss:.5f} at step {step}...")
 
         if step >= train_steps:
             # stop training after this many steps/train_tokens
