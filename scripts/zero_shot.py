@@ -1093,7 +1093,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stl_cache_dir",
         type=str,
-        default="/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench/metadata/stl_cache",
+        default="",
         help="STL 分解结果缓存目录（LMDB）。为空则不启用。",
     )
     parser.add_argument(
