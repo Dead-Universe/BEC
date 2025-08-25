@@ -1,6 +1,7 @@
 from typing import Dict, Optional, Tuple, Literal
 import math
 
+from buildings_bench.models.moe import MoEActivationHook
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -155,13 +156,8 @@ class LoadForecastingTransformerMoE(BaseModel):
         ), f"输入序列长度 {load.size(1)} ≠ context_len({context_len}) + pred_len({pred_len})"
 
         # ② 分解
-        seasonal, trend, residual = self.decomp(load)
-        s_ctx, t_ctx, r_ctx = (
-            seasonal[:, :context_len],
-            trend[:, :context_len],
-            residual[:, :context_len],
-        )
-
+        seasonal, trend, residual = self.decomp(load[:, :context_len])
+        s_ctx, t_ctx, r_ctx = seasonal, trend, residual
         # ③ 嵌入 & 编码
         s_mem = self.seasonal_encoder(self.seasonal_embedding(s_ctx))
         t_mem = self.trend_encoder(self.trend_embedding(t_ctx))
@@ -248,34 +244,106 @@ class LoadForecastingTransformerMoE(BaseModel):
 
 # -------------------------- 简单自测 ----------------------------
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 创建模型
-    model = (
-        LoadForecastingTransformerMoE(
-            max_context_len=672, max_pred_len=168, continuous_head="huber"
-        )
-        .to(device)
-        .train()
+    import os
+    from pathlib import Path
+    import pandas as pd
+    import torch
+
+    # ───────────────────────────────────────────
+    # Ⅰ. 读 CSV（最后 168+24=192 行）
+    # ───────────────────────────────────────────
+    # CSV_PATH = "/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench/SMART/HomeG_clean=2016.csv"
+    CSV_PATH = "/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench/Borealis/home2_clean=2011.csv"
+    df = (
+        pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
+        .sort_values("timestamp")
+        .iloc[-192:]
     )
 
-    # 随机动态长度
-    ctx, pred = 96, 40  # 任意 ≤ 最大上限
-    B = 2
-    T = ctx + pred
+    y_raw = df["power"].values.astype("float32")  # (192,)
 
-    dummy = {"load": torch.rand(B, T, 1, device=device)}
-    target = dummy["load"][:, -pred:]
+    # ───────────────────────────────────────────
+    # Ⅱ. Box‑Cox 归一化
+    # ───────────────────────────────────────────
+    from buildings_bench.transforms import BoxCoxTransform
 
-    # 前向 & 反传
-    out = model(dummy, context_len=ctx, pred_len=pred)
-    loss = model.loss(out, target)
-    loss.backward()
+    boxcox = BoxCoxTransform()
+    transform_dir = (
+        Path(
+            os.environ.get(
+                "BUILDINGS_BENCH",
+                "/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench",
+            )
+        )
+        / "metadata"
+        / "transforms"
+    )
+    boxcox.load(transform_dir)
 
-    print("Sanity-check OK – loss:", float(loss))
+    y_norm = torch.from_numpy(boxcox.transform(y_raw))  # tensor (192,)
 
-    # 推理
-    model.eval()
-    preds, _ = model.predict(dummy, context_len=ctx, pred_len=pred)
-    print("Inference preds shape:", preds.shape)  # [B, pred, 1]
+    # quick sanity…往返误差应极小
+    rt_diff = (torch.from_numpy(y_raw) - boxcox.undo_transform(y_norm)).abs().max()
+    print(f"↔ Box‑Cox round‑trip max|diff|: {rt_diff:.3e}")
+
+    # ───────────────────────────────────────────
+    # Ⅲ. 打包模型输入 [B=1, T=192, 1]
+    # ───────────────────────────────────────────
+    sample = {"load": y_norm.unsqueeze(0).unsqueeze(-1)}  # (1,192,1)
+    y_true_raw = y_raw[-24:]
+
+    # ───────────────────────────────────────────
+    # Ⅳ. 载入模型与权重
+    # ───────────────────────────────────────────
+
+    cfg = dict(
+        context_len=168,
+        pred_len=24,
+        num_encoder_layers=6,
+        num_decoder_layers=8,
+        d_model=768,
+        dim_feedforward=2048,
+        num_experts=8,
+        top_k=2,
+        nhead=12,
+        dropout=0.0,
+        continuous_loads=True,
+        continuous_head="huber",
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = LoadForecastingTransformerMoE(**cfg).to(device).eval()
+
+    moe_hook = MoEActivationHook(model, sync_ddp=True)
+
+    CKPT = "/home/hadoop/bec/BuildingsBench/checkpoints/TransformerWithGaussianAndMoEs-L_Update-15-huber_best_val.pt.best"
+    if not os.path.exists(CKPT):
+        raise FileNotFoundError(f"Checkpoint not found: {CKPT}")
+    model.load_from_checkpoint(CKPT)
+    print(f"✅ Loaded checkpoint: {CKPT}")
+
+    # ───────────────────────────────────────────
+    # Ⅴ. 推断 & 反归一化
+    # ───────────────────────────────────────────
+    with torch.no_grad():
+        pred_norm, _ = model.predict(
+            {k: v.to(device) for k, v in sample.items()}
+        )  # (1,24,1)
+
+    pred_raw = boxcox.undo_transform(pred_norm.cpu()).squeeze()  # (24,)
+
+    # ───────────────────────────────────────────
+    # Ⅵ. 打印结果
+    # ───────────────────────────────────────────
+    print("\n=== 24‑hour Forecast vs Truth (kW) ===")
+    print(" idx |  predict |   actual")
+    print("-----+----------+----------")
+    for i, (p_pred, p_true) in enumerate(zip(pred_raw, y_true_raw), 1):
+        # p_pred 可能是 0‑维 tensor；p_true 一定是 float
+        p_val = float(p_pred) if isinstance(p_pred, torch.Tensor) else p_pred
+        print(f" t+{i:02d} | {p_val:8.5f} | {p_true:8.5f}")
+
+    fig = moe_hook.plot(normalize=True)
+
+    fig.savefig("moe_activation_heatmap.png")
