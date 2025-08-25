@@ -20,13 +20,13 @@ top_k = 2
 # experts_per_gp = 2
 
 [pretrain]
-batch_size = 512
+batch_size = 256
 init_scale = 0.02
 warmup_steps = 10000
 lr = 0.00006
-train_tokens = 4000000000
+train_tokens = 8000000000
 apply_scaler_transform = 'boxcox'
-note = "Update-15-huber"
+note = "Update-20-huber"
 
 [zero_shot]
 apply_scaler_transform = 'boxcox'

@@ -22,9 +22,10 @@ batch_size = 32
 init_scale = 0.02
 warmup_steps = 20000
 lr = 0.00006
-train_tokens = 4000000000
+train_tokens = 2000000000
+eval_every = 200
 apply_scaler_transform = 'boxcox'
-note = "Update-19-huber"
+note = "Update-20-huber"
 
 [zero_shot]
 batch_size = 2048
