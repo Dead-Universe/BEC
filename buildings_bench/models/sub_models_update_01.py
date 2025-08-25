@@ -231,6 +231,7 @@ class Gate(nn.Module):
         返回 routing weights 和 experts indices
         """
         scores = self.router(x)
+        self.last_logits = scores
         # 评分函数
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
