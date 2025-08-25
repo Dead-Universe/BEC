@@ -462,7 +462,9 @@ class Encoder(nn.Module):
             else MoE(args)
         )
         if args.use_dense:
-            self.ffn = MLP(args.dim, (args.n_routed_experts + 1) * args.moe_inter_dim)
+            self.ffn = MLP(
+                args.dim, (args.n_activated_experts + 1) * args.moe_inter_dim
+            )
 
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
@@ -528,7 +530,9 @@ class Decoder(nn.Module):
             else MoE(args)
         )
         if args.use_dense:
-            self.ffn = MLP(args.dim, (args.n_routed_experts + 1) * args.moe_inter_dim)
+            self.ffn = MLP(
+                args.dim, (args.n_activated_experts + 1) * args.moe_inter_dim
+            )
         self.norm2 = RMSNorm(args.dim)
         self.multihead_attn = RoPEMultiheadAttention(
             embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
