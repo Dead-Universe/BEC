@@ -49,6 +49,7 @@ model_registry = {
     "TransformerWithGaussianAndMoEs-M": LoadForecastingTransformerMoE,
     "TransformerWithGaussianAndMoEs-L": LoadForecastingTransformerMoE,
     "TransformerWithGaussianAndMoEs-S": LoadForecastingTransformerMoE,
+    "Transformer-L": LoadForecastingTransformerMoE,
     "TimeSeriesTransformer-S": TimeSeriesTransformer,
     "PatchTST-S": LoadForecastingPatchTST_A,
     "TimeMoE-S": TimeMoeForecasting,
