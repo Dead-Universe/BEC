@@ -10,8 +10,10 @@ train_mixed.py  –  变长输入 / 输出混合训练 + 验证 RMSE/MAE
 """
 
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import argparse, datetime, math, os, random, tomli, numpy as np
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -20,6 +22,7 @@ import torch.utils.data.distributed
 import torch.amp
 import transformers
 import swanlab
+from statsmodels.tsa.seasonal import STL
 
 # ---------- 项目依赖 ----------
 from buildings_bench import utils
@@ -28,19 +31,71 @@ from buildings_bench.models import model_factory
 from buildings_bench.tokenizer import LoadQuantizer
 from buildings_bench.transforms import BoxCoxTransform, StandardScalerTransform
 
+
+# 建议在训练脚本入口处限制底层 BLAS 线程，避免和批内并行抢核
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+# 复用的线程池（每个 DataLoader worker 会各自持有一份）
+_STL_POOL = None
+
+
+def _get_pool(n_workers: int):
+    global _STL_POOL
+    if _STL_POOL is None:
+        _STL_POOL = ThreadPoolExecutor(max_workers=n_workers)
+    return _STL_POOL
+
+
+def _stl_one_series(x_ctx_fp64: np.ndarray, period: int = 24, robust: bool = False):
+    """
+    在 Box-Cox 尺度上对一条 context 段做 STL。
+    返回 (S_ctx, T_ctx, R_ctx)，都是 float32，长度 = len(x_ctx_fp64)。
+    失败时回退到简易移动平均趋势。
+    """
+    try:
+        stl = STL(x_ctx_fp64, period=period, robust=robust)  # 可按需加 seasonal/trend
+        res = stl.fit()
+        S = res.seasonal.astype(np.float32)
+        T = res.trend.astype(np.float32)
+    except Exception:
+        # 回退：奇数窗口的移动平均作为趋势；季节取残差
+        win = max(3, (period // 2) * 2 + 1)  # 约等于 period/2，保证奇数
+        kern = np.ones(win, dtype=np.float64) / win
+        T = np.convolve(x_ctx_fp64, kern, mode="same").astype(np.float32)
+        S = x_ctx_fp64.astype(np.float32) - T
+    R = x_ctx_fp64.astype(np.float32) - S - T
+    return S, T, R
+
+
 # ════════════════════════════════════════════════════════════
 # 1. collate_fn   (ctx/pred 上下限来自 CLI)
 # ════════════════════════════════════════════════════════════
+
 CTX_MIN, CTX_MAX = 24, 336
 PRED_MIN, PRED_MAX = 1, 168
 
+STL_ENABLED = False
 
-def mixed_len_collate(batch):
+
+def mixed_len_collate(
+    batch,
+    stl_period: int = 24,
+    stl_robust: bool = True,
+    max_workers: int | None = None,
+):
+    """
+    - 随机 ctx_len/pred_len，堆叠基础特征；
+    - 在 Box-Cox 尺度上对 load[:ctx_len] 做 STL，得到 stl_S/T/R；
+    - stl_* 的预测段填 0（不泄漏）。
+    """
     ctx_len = random.randint(CTX_MIN, CTX_MAX)
     pred_len = random.randint(PRED_MIN, PRED_MAX)
     seq_len = ctx_len + pred_len
 
-    # 裁剪
+    # 裁剪到随机序列长度
     for s in batch:
         for k, v in s.items():
             if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim >= 1:
@@ -53,6 +108,7 @@ def mixed_len_collate(batch):
         out = torch.stack(ts)
         return out if dtype is None else out.to(dtype)
 
+    # 先把你原有的字段堆好
     collated = {
         "latitude": _stack("latitude", torch.float32),
         "longitude": _stack("longitude", torch.float32),
@@ -60,27 +116,69 @@ def mixed_len_collate(batch):
         "day_of_week": _stack("day_of_week", torch.float32),
         "hour_of_day": _stack("hour_of_day", torch.float32),
         "building_type": _stack("building_type", torch.long),
-        "load": _stack("load", torch.float32),
+        "load": _stack("load", torch.float32),  # 注意：这里已是 Box-Cox 尺度
     }
     for k in batch[0]:
         if k not in collated:
             collated[k] = _stack(k, torch.float32)
+    if STL_ENABLED:
 
-    collated["context_len"] = ctx_len
-    collated["pred_len"] = pred_len
+        # ─────────────────────────────────────────────────────────────
+        # 在 collate_fn 里做 STL（仅 context 段），跨样本并行
+        # ─────────────────────────────────────────────────────────────
+        load = collated["load"]  # [B, seq_len, 1], float32, CPU
+        B = load.shape[0]
+
+        # 取 context 段并转 numpy float64（statsmodels 偏好）
+        X_ctx = [
+            load[i, :ctx_len, 0].numpy().astype(np.float64, copy=False)
+            for i in range(B)
+        ]
+
+        S = torch.zeros(B, seq_len, 1, dtype=torch.float32)
+        T = torch.zeros(B, seq_len, 1, dtype=torch.float32)
+        R = torch.zeros(B, seq_len, 1, dtype=torch.float32)
+
+        n_workers = max_workers or min(os.cpu_count() or 1, B)
+        pool = _get_pool(n_workers)
+
+        futs = [pool.submit(_stl_one_series, x, stl_period, stl_robust) for x in X_ctx]
+
+        for i, f in enumerate(futs):
+            s_ctx, t_ctx, r_ctx = f.result()
+            S[i, :ctx_len, 0] = torch.from_numpy(s_ctx)
+            T[i, :ctx_len, 0] = torch.from_numpy(t_ctx)
+            R[i, :ctx_len, 0] = torch.from_numpy(r_ctx)
+
+        collated["stl_S"] = S  # Box-Cox 尺度
+        collated["stl_T"] = T
+        collated["stl_R"] = R
+
+    collated["context_len"] = torch.tensor(ctx_len)
+    collated["pred_len"] = torch.tensor(pred_len)
     return collated
 
 
 # === NEW
-def fixed_len_collate(batch, ctx_len: int, pred_len: int):
+def fixed_len_collate(
+    batch,
+    ctx_len: int,
+    pred_len: int,
+    *,
+    stl_period: int = 24,
+    stl_robust: bool = True,
+    max_workers: int | None = None,
+):
     """
-    把样本裁剪/填充到固定 (ctx_len + pred_len)，
-    不再随机长度，专供验证。
+    把样本裁剪到固定 (ctx_len + pred_len)，并在 Box-Cox 尺度对 load[:ctx_len] 做 STL。
+    生成 stl_S/T/R（预测段填 0）。
     """
     seq_len = ctx_len + pred_len
+
+    # 裁剪
     for s in batch:
         for k, v in s.items():
-            if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim >= 1:
+            if isinstance(v, (torch.Tensor, np.ndarray)) and getattr(v, "ndim", 0) >= 1:
                 if v.shape[0] < seq_len:
                     raise ValueError(f"val 样本过短: {v.shape[0]} < {seq_len}")
                 s[k] = v[:seq_len]
@@ -90,6 +188,7 @@ def fixed_len_collate(batch, ctx_len: int, pred_len: int):
         out = torch.stack(ts)
         return out if dtype is None else out.to(dtype)
 
+    # 先堆基础字段
     merged = {
         "latitude": _stack("latitude", torch.float32),
         "longitude": _stack("longitude", torch.float32),
@@ -97,16 +196,42 @@ def fixed_len_collate(batch, ctx_len: int, pred_len: int):
         "day_of_week": _stack("day_of_week", torch.float32),
         "hour_of_day": _stack("hour_of_day", torch.float32),
         "building_type": _stack("building_type", torch.long),
-        "load": _stack("load", torch.float32),
-        "context_len": torch.tensor(ctx_len),
-        "pred_len": torch.tensor(pred_len),
+        "load": _stack("load", torch.float32),  # 注意：应为 Box-Cox 尺度
     }
+    # 任何额外键（例如天气列）也一并堆起来
+    for k in batch[0]:
+        if k not in merged and isinstance(batch[0][k], (torch.Tensor, np.ndarray)):
+            merged[k] = _stack(k, torch.float32)
+    if STL_ENABLED:
+        # ── STL 分解：仅 context 段 ─────────────────────────────────────
+        load = merged["load"]  # [B, seq_len, 1]
+        B = load.shape[0]
+
+        X_ctx = [
+            load[i, :ctx_len, 0].numpy().astype(np.float64, copy=False)
+            for i in range(B)
+        ]
+        S = torch.zeros(B, seq_len, 1, dtype=torch.float32)
+        T = torch.zeros(B, seq_len, 1, dtype=torch.float32)
+        R = torch.zeros(B, seq_len, 1, dtype=torch.float32)
+
+        n_workers = max_workers or min(os.cpu_count() or 1, B)
+        pool = _get_pool(n_workers)
+        futs = [pool.submit(_stl_one_series, x, stl_period, stl_robust) for x in X_ctx]
+        for i, f in enumerate(futs):
+            s_ctx, t_ctx, r_ctx = f.result()
+            S[i, :ctx_len, 0] = torch.from_numpy(s_ctx)
+            T[i, :ctx_len, 0] = torch.from_numpy(t_ctx)
+            R[i, :ctx_len, 0] = torch.from_numpy(r_ctx)
+
+        merged["stl_S"] = S  # Box-Cox 尺度
+        merged["stl_T"] = T
+        merged["stl_R"] = R
+    merged["context_len"] = torch.tensor(ctx_len)
+    merged["pred_len"] = torch.tensor(pred_len)
     return merged
 
 
-# ════════════════════════════════════════════════════════════
-# 2. 验证循环 – 平均 RMSE & MAE             # === NEW
-# ════════════════════════════════════════════════════════════
 @torch.no_grad()
 def evaluate(model, val_loader, transform, inverse, device):
     model.eval()
@@ -141,7 +266,6 @@ def evaluate(model, val_loader, transform, inverse, device):
     return rmse, mae
 
 
-# === NEW
 @torch.no_grad()
 def evaluate_all(model, loaders_dict, transform, inverse, device):
     """
@@ -149,9 +273,12 @@ def evaluate_all(model, loaders_dict, transform, inverse, device):
     """
     model.eval()
     out = {}
+
     for (c, p), loader in loaders_dict.items():
+        i = 0
         se, ae, n = 0.0, 0.0, 0
         for batch in loader:
+            i += 1
             for k in batch:
                 batch[k] = batch[k].to(device)
             batch["load"] = transform(batch["load"])
@@ -163,7 +290,10 @@ def evaluate_all(model, loaders_dict, transform, inverse, device):
             se += (err**2).sum().item()
             ae += err.abs().sum().item()
             n += err.numel()
+            if i >= 100:
+                break
         out[(c, p)] = (math.sqrt(se / n), ae / n)
+
     model.train()
     return out
 
@@ -172,7 +302,6 @@ def evaluate_all(model, loaders_dict, transform, inverse, device):
 # 3. 主函数
 # ════════════════════════════════════════════════════════════
 SCRIPT_PATH = Path(os.path.realpath(__file__)).parent
-DATASET_FULL = True
 # === NEW: 固定验证窗口 (ctx_len, pred_len) 组合 ===
 VAL_COMBOS = [
     (168, 24),
@@ -183,9 +312,10 @@ VAL_COMBOS = [
 
 
 def main(args, model_args):
-    global CTX_MIN, CTX_MAX, PRED_MIN, PRED_MAX
+    global CTX_MIN, CTX_MAX, PRED_MIN, PRED_MAX, STL_ENABLED
     CTX_MIN, CTX_MAX = args.ctx_min, args.ctx_max
     PRED_MIN, PRED_MAX = args.pred_min, args.pred_max
+    STL_ENABLED = args.stl_enabled
 
     utils.set_seed(args.random_seed)
     torch.backends.cudnn.deterministic = False  # 更快；如需复现设 True
@@ -234,13 +364,26 @@ def main(args, model_args):
     model, loss_fn, _ = model_factory(args.model, model_args)
     model = model.to(local_rank)
 
-    train_ds, val_ds, _ = build_datasets(
+    # 打印模型参数
+    if args.rank == 0:
+        count_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(
+            f"[rank 0] Model: {args.model}  "
+            f"ctx_len={model_args['max_context_len']}  "
+            f"pred_len={model_args['max_pred_len']}  "
+            f"params={count_parameters:,}  "
+            f"continuous_loads={model.continuous_loads}  "
+            f"continuous_head={model.continuous_head}",
+            flush=True,
+        )
+
+    train_ds, val_ds = build_datasets(
         context_len=model_args["max_context_len"],
         pred_len=model_args["max_pred_len"],
         apply_scaler_transform=args.apply_scaler_transform,
-        split="val",
-        oov_val=Path("/home/hadoop/bec/BuildingsBench/oov_val.txt"),
-        oov_test=Path("/home/hadoop/bec/BuildingsBench/oov_test.txt"),
+        # split="val",
+        # oov_val=Path("./oov_val.txt"),
+        # oov_test=Path("./oov_test.txt"),
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -467,12 +610,7 @@ def main(args, model_args):
                 f"loss={loss:.4f} H={pred_len} tok_seen={seen_tokens/1e6:.1f}M",
                 flush=True,
             )
-        if args.rank == 0 and step % 5000 == 0:
-            print(
-                f"[rank 0] 已训练 {seen_tokens / 1e6:.1f}M tokens "
-                f"（{update_idx}/{total_updates} 更新）",
-                flush=True,
-            )
+        if args.rank == 0 and step % 10000 == 0:
             utils.save_model_checkpoint(
                 model,
                 optimizer,
@@ -481,6 +619,7 @@ def main(args, model_args):
                 best_val_rmse,
                 checkpoint_dir / f"{ckpt_name}_iter{step}.pt",
             )
+            print(f"[rank 0] 已保存迭代 {step} 的检查点", flush=True)
 
         if update_idx >= total_updates:
             break
@@ -553,9 +692,11 @@ if __name__ == "__main__":
     p.add_argument(
         "--swanlab_id",
         type=str,
-        default="",
+        default=None,
         help="SwanLab 实验 ID（用于实验追踪）",
     )
+    # STL相关
+    p.add_argument("--stl_enabled", action="store_true", help="是否启用STL拆分")
 
     args = p.parse_args()
 
