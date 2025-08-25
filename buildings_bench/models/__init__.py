@@ -18,6 +18,7 @@ from buildings_bench.models.transformer_moes_update_20 import (
 from buildings_bench.models.sub_models import TimeSeriesTransformer
 from buildings_bench.models.patchtst import LoadForecastingPatchTST_A
 from buildings_bench.models.timemoe import TimeMoeForecasting
+from buildings_bench.models.chronos import ChronosAsLoadForecastAdapter
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
@@ -54,6 +55,7 @@ model_registry = {
     "PatchTST-S": LoadForecastingPatchTST_A,
     "TimeMoE-S": TimeMoeForecasting,
     "TimeMoE-L": TimeMoeForecasting,
+    "Chronos-L": ChronosAsLoadForecastAdapter,
 }
 
 
