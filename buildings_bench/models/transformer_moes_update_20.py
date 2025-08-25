@@ -35,6 +35,7 @@ class LoadForecastingTransformerMoE(BaseModel):
         continuous_head: Literal["mse", "gaussian_nll", "huber"] = "mse",
         ignore_spatial: bool = False,
         weather_inputs: list | None = None,
+        use_dense: bool = False,
     ):
         super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
         self.max_context_len = max_context_len
@@ -59,6 +60,7 @@ class LoadForecastingTransformerMoE(BaseModel):
             n_limited_groups=1,
             score_func="softmax",
             route_scale=1.0,
+            use_dense=use_dense,
         )
 
         enc_layer = Encoder(self.cfg.n_dense_layers, self.cfg)

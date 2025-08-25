@@ -141,6 +141,7 @@ class ModelArgs(PyBaseModel):
     building_type: int = 2
     context_len: int = 168
     pred_len: int = 24
+    use_dense: bool = False
 
     model_config = ConfigDict(
         extra="ignore",  # 多余键直接忽略；改成 "forbid" 可强制报错
@@ -460,6 +461,8 @@ class Encoder(nn.Module):
             if layer_id < args.n_dense_layers
             else MoE(args)
         )
+        if args.use_dense:
+            self.ffn = MLP(args.dim, (args.n_routed_experts + 1) * args.moe_inter_dim)
 
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
@@ -524,6 +527,8 @@ class Decoder(nn.Module):
             if layer_id < args.n_dense_layers
             else MoE(args)
         )
+        if args.use_dense:
+            self.ffn = MLP(args.dim, (args.n_routed_experts + 1) * args.moe_inter_dim)
         self.norm2 = RMSNorm(args.dim)
         self.multihead_attn = RoPEMultiheadAttention(
             embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
