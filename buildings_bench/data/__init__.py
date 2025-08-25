@@ -26,6 +26,7 @@ dataset_registry = [
     "smart",
     "lcl",
     "university",
+    "cofactor",
 ]
 
 benchmark_registry = [
@@ -41,6 +42,7 @@ benchmark_registry = [
     "smart",
     "lcl",
     "university",
+    "cofactor",
 ]
 
 
