@@ -1,6 +1,8 @@
 import torch
 from buildings_bench.models.base_model import BaseModel
-from buildings_bench.models.transformers import TimeSeriesSinusoidalPeriodicEmbedding
+from buildings_bench.models.self_transformers import (
+    TimeSeriesSinusoidalPeriodicEmbedding,
+)
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Dict, List
