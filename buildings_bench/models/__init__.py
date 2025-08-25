@@ -5,17 +5,19 @@ from typing import Callable, Tuple, Dict
 # Import models here
 from buildings_bench.models.dlinear_regression import DLinearRegression
 from buildings_bench.models.linear_regression import LinearRegression
-from buildings_bench.models.transformers import LoadForecastingTransformer
+from buildings_bench.models.self_transformers import LoadForecastingTransformer
 from buildings_bench.models.persistence import (
     AveragePersistence,
     CopyLastDayPersistence,
     CopyLastWeekPersistence,
 )
 from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
-from buildings_bench.models.transformer_moes_update_12 import (
+from buildings_bench.models.transformer_moes_update_20 import (
     LoadForecastingTransformerMoE,
 )
 from buildings_bench.models.sub_models import TimeSeriesTransformer
+from buildings_bench.models.patchtst import LoadForecastingPatchTST_A
+from buildings_bench.models.timemoe import TimeMoeForecasting
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
@@ -48,6 +50,9 @@ model_registry = {
     "TransformerWithGaussianAndMoEs-L": LoadForecastingTransformerMoE,
     "TransformerWithGaussianAndMoEs-S": LoadForecastingTransformerMoE,
     "TimeSeriesTransformer-S": TimeSeriesTransformer,
+    "PatchTST-S": LoadForecastingPatchTST_A,
+    "TimeMoE-S": TimeMoeForecasting,
+    "TimeMoE-L": TimeMoeForecasting,
 }
 
 
