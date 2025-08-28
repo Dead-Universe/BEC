@@ -10,12 +10,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import copy
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch.nn as nn
-from transformers import AutoConfig
 from transformers.models.t5.modeling_t5 import (
     ACT2FN,
     T5Config,
@@ -596,7 +594,6 @@ from buildings_bench.models.base_model import BaseModel
 
 
 import copy
-import os
 
 
 class ChronosAsLoadForecastAdapter(BaseModel):
@@ -737,7 +734,21 @@ class ChronosAsLoadForecastAdapter(BaseModel):
         return self.chronos.parameters()
 
     # ----------------- load checkpoint -------------------
-    def load_from_checkpoint(self, checkpoint_path: str | bytes | "os.PathLike"):
+    def _strip_prefixes(self, sd: dict) -> dict:
+        new_sd = {}
+        for k, v in sd.items():
+            if k.startswith("module.chronos."):
+                new_sd[k[len("module.chronos.") :]] = v
+            elif k.startswith("chronos."):
+                new_sd[k[len("chronos.") :]] = v
+            elif k.startswith("module."):
+                # 万一保存的是直接的内层模型但被 DataParallel 包过
+                new_sd[k[len("module.") :]] = v
+            else:
+                new_sd[k] = v
+        return new_sd
+
+    def load_from_checkpoint(self, checkpoint_path):
         sd = torch.load(checkpoint_path, map_location="cpu")
         if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
             sd = sd["model"]
@@ -745,12 +756,13 @@ class ChronosAsLoadForecastAdapter(BaseModel):
             raise ValueError(
                 "无效的 checkpoint：应为 state_dict 或 {'model': state_dict}"
             )
-        missing, unexpected = self.chronos.load_state_dict(sd, strict=False)
-        if missing or unexpected:
-            print(
-                "[Chronos Adapter] load_state_dict differences:",
-                f"missing={missing}, unexpected={unexpected}",
-            )
+
+        sd = self._strip_prefixes(sd)
+        missing, unexpected = self.chronos.load_state_dict(sd, strict=True)
+        print(
+            "[Chronos Adapter] load_state_dict differences:",
+            f"missing={missing}, unexpected={unexpected}",
+        )
 
 
 # ======================= Quick self-test =======================
