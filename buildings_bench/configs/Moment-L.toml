@@ -1,0 +1,30 @@
+[model]
+context_len = 168
+pred_len = 24
+max_context_len = 336
+max_pred_len = 168
+num_encoder_layers = 16
+num_heads = 12
+dim_feedforward = 2048
+d_model = 768
+continuous_loads = true
+continuous_head = 'huber'
+patch_len = 8
+patch_stride_len = 8
+seq_len = 512
+
+[pretrain]
+batch_size = 32
+init_scale = 0.02
+warmup_steps = 10000
+lr = 0.00006
+train_tokens = 2000000000
+eval_every = 200
+apply_scaler_transform = 'boxcox'
+note = ''
+
+[zero_shot]
+apply_scaler_transform = 'boxcox'
+
+[transfer_learning]
+apply_scaler_transform = 'boxcox'
