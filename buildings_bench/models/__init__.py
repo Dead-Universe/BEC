@@ -20,6 +20,8 @@ from buildings_bench.models.patchtst import LoadForecastingPatchTST_A
 from buildings_bench.models.timemoe import TimeMoeForecasting
 from buildings_bench.models.chronos import ChronosAsLoadForecastAdapter
 from buildings_bench.models.moment import MomentAsLoadForecastAdapter
+from buildings_bench.models.autoformer import AutoformerUnified
+from buildings_bench.models.nliner import NLinearUnified
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
@@ -59,6 +61,8 @@ model_registry = {
     "TimeMoE-L": TimeMoeForecasting,
     "Chronos-L": ChronosAsLoadForecastAdapter,
     "Moment-L": MomentAsLoadForecastAdapter,
+    "Autoformer-L": AutoformerUnified,
+    "NLinear": NLinearUnified,
 }
 
 
