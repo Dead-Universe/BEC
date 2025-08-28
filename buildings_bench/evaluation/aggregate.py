@@ -438,6 +438,58 @@ def return_aggregate(
     oov_file=None,  # 新增：白名单文件路径；若提供，则仅保留文件中列出的楼宇
     reps=50_000,
     seed: int | None = 0,  # 新增：全局种子；None 表示保持随机
+    cofactor_type: dict[str, list[str]] | None = {
+        "Kindergarten": [
+            "building6396",
+            "building6398",
+            "building6402",
+            "building6405",
+            "building6406",
+            "building6407",
+            "building6409",
+            "building6415",
+            "building6419",
+            "building6421",
+            "building6422",
+            "building6425",
+            "building6426",
+            "building6428",
+            "building6429",
+            "building6433",
+            "building6434",
+            "building6437",
+            "building6439",
+            "building6443",
+        ],
+        "School": [
+            "building6397",
+            "building6400",
+            "building6404",
+            "building6408",
+            "building6413",
+            "building6414",
+            "building6416",
+            "building6418",
+            "building6420",
+            "building6424",
+            "building6431",
+            "building6432",
+            "building6438",
+            "building6440",
+            "building6444",
+            "building6445",
+        ],
+        "NursingHome": [
+            "building6399",
+            "building6410",
+            "building6412",
+            "building6417",
+            "building6423",
+            "building6436",
+            "building6442",
+        ],
+        "Office": ["building6411", "building6441"],
+    },  # ← 新增
 ):
     """
     计算指定模型在不同 building_type / metric / dataset 下的均值及 95% bootstrap CI。
@@ -546,6 +598,48 @@ def return_aggregate(
                 # ----------- 只保留当前 building_type ----------- #
                 df = df[df["building_type"] == bt]  # bt 本身就是标准小写
 
+                # ----------- cofactor 数据集细分为子数据集 ----------- #
+                # 仅当提供了 cofactor_type 字典且存在 'dataset' / 'building_id' 列时启用
+                if (
+                    cofactor_type
+                    and "dataset" in df.columns
+                    and "building_id" in df.columns
+                ):
+                    # 构建 building_id -> Category 全称 的反向映射（全部转小写以对齐前面的统一小写）
+                    id2cat = {}
+                    for full_cat, bid_list in cofactor_type.items():
+                        for bid in bid_list:
+                            id2cat[str(bid).lower()] = (
+                                full_cat  # e.g. 'building6396' -> 'Kindergarten'
+                            )
+
+                    # 仅处理 dataset == 'cofactor' 的行
+                    is_cof = df["dataset"].eq("cofactor")
+                    if is_cof.any():
+                        # 映射函数：cofactor -> cofactor:【Category】，否则保留原样
+                        def _cof_ds_map(row):
+                            if row["dataset"] != "cofactor":
+                                return row["dataset"]
+                            bid = str(row["building_id"]).lower()
+                            full_cat = id2cat.get(bid)
+                            if not full_cat:
+                                print(f"[WARN] cofactor building_id 未找到类型：{bid}")
+                                return "cofactor:Unknown"
+                            return f"cofactor:{full_cat}"
+
+                        # 只对 cofactor 行做改名，保持大小写为可读全称
+                        df.loc[is_cof, "dataset"] = df.loc[
+                            is_cof, ["dataset", "building_id"]
+                        ].apply(
+                            lambda r: _cof_ds_map(
+                                {
+                                    "dataset": r["dataset"],
+                                    "building_id": r["building_id"],
+                                }
+                            ),
+                            axis=1,
+                        )
+
                 # ----------- inf / nan 处理 ----------- #
                 n_nan = df["value"].isna().sum()
                 n_inf = np.isinf(df["value"]).sum()
@@ -633,7 +727,36 @@ if __name__ == "__main__":
     import os
 
     results_dir = "/home/hadoop/bec/BuildingsBench/results"
-    models = ["timemoe:168_12"]
+    models = [
+        "TimeMoE-L:168_1",
+        "TimeMoE-L:168_6",
+        "TimeMoE-L:168_12",
+        "TimeMoE-L:168_24",
+        "TimeMoE-L:168_48",
+        "TimeMoE-L:168_96",
+        "TimeMoE-L:168_168",
+        "TransformerWithGaussianAndMoEs-L:168_1",
+        "TransformerWithGaussianAndMoEs-L:168_6",
+        "TransformerWithGaussianAndMoEs-L:168_12",
+        "TransformerWithGaussianAndMoEs-L:168_24",
+        "TransformerWithGaussianAndMoEs-L:168_48",
+        "TransformerWithGaussianAndMoEs-L:168_96",
+        "TransformerWithGaussianAndMoEs-L:168_168",
+        "Chronos-L:168_1",
+        "Chronos-L:168_6",
+        "Chronos-L:168_12",
+        "Chronos-L:168_24",
+        "Chronos-L:168_48",
+        "Chronos-L:168_96",
+        "Chronos-L:168_168",
+        "Transformer-L:168_1",
+        "Transformer-L:168_6",
+        "Transformer-L:168_12",
+        "Transformer-L:168_24",
+        "Transformer-L:168_48",
+        "Transformer-L:168_96",
+        "Transformer-L:168_168",
+    ]
 
     oov = []  # ← 你的 oov 列表
     with open(Path(os.environ["BUILDINGS_BENCH"]) / "metadata" / "oov.txt") as f:
@@ -647,7 +770,7 @@ if __name__ == "__main__":
         metrics=["nrmse", "nmae"],
         aggregate="mean",
         oov_list=oov,
-        oov_file="/home/hadoop/bec/BuildingsBench/oov_test.txt",
+        # oov_file="/home/hadoop/bec/BuildingsBench/oov_test.txt",
     )
     pretty_print(res_med, aggregate="mean")
 
@@ -659,6 +782,6 @@ if __name__ == "__main__":
         metrics=["nrmse", "nmae"],
         aggregate="mean",
         oov_list=oov,
-        # oov_file="/home/hadoop/bec/BuildingsBench/oov_test.txt",
+        oov_file="/home/hadoop/bec/BuildingsBench/oov_test.txt",
     )
     pretty_print(res_mean, aggregate="mean")
