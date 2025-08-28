@@ -1,0 +1,31 @@
+[model]
+context_len = 336
+pred_len = 168
+max_context_len = 336
+max_pred_len = 168
+e_layers = 8
+d_layers = 8
+n_heads = 12
+d_ff = 2048
+d_model = 768
+dropout = 0.0
+activation = 'gelu'
+continuous_loads = true
+continuous_head = 'huber'
+
+[pretrain]
+batch_size = 32
+init_scale = 0.02
+warmup_steps = 20000
+lr = 0.00006
+train_tokens = 2000000000
+eval_every = 200
+apply_scaler_transform = 'boxcox'
+note = ''
+
+[zero_shot]
+batch_size = 2048
+apply_scaler_transform = 'boxcox'
+
+[transfer_learning]
+apply_scaler_transform = 'boxcox'
