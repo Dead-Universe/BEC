@@ -3,7 +3,7 @@ import torch
 from typing import Callable, Tuple, Dict
 
 # Import models here
-from buildings_bench.models.dlinear_regression import DLinearRegression
+from buildings_bench.models.dlinear_regression import DLinearRegression, DLinearUnified
 from buildings_bench.models.linear_regression import LinearRegression
 from buildings_bench.models.self_transformers import LoadForecastingTransformer
 from buildings_bench.models.persistence import (
@@ -19,6 +19,7 @@ from buildings_bench.models.sub_models import TimeSeriesTransformer
 from buildings_bench.models.patchtst import LoadForecastingPatchTST_A
 from buildings_bench.models.timemoe import TimeMoeForecasting
 from buildings_bench.models.chronos import ChronosAsLoadForecastAdapter
+from buildings_bench.models.moment import MomentAsLoadForecastAdapter
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
@@ -45,6 +46,7 @@ model_registry = {
     "CopyLastWeekPersistence": CopyLastWeekPersistence,
     "LinearRegression": LinearRegression,
     "DLinearRegression": DLinearRegression,
+    "DLinearUnified": DLinearUnified,
     "DeepAutoregressiveRNN": DeepAutoregressiveRNN,
     # Register your model here
     "TransformerWithGaussianAndMoEs-M": LoadForecastingTransformerMoE,
@@ -56,6 +58,7 @@ model_registry = {
     "TimeMoE-S": TimeMoeForecasting,
     "TimeMoE-L": TimeMoeForecasting,
     "Chronos-L": ChronosAsLoadForecastAdapter,
+    "Moment-L": MomentAsLoadForecastAdapter,
 }
 
 
