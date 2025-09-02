@@ -30,28 +30,22 @@ class MomentAsLoadForecastAdapter(nn.Module):
         d_model: int = 768,
         dim_feedforward: int = 2048,  # T5Config.d_ff
         num_heads: int = 12,
-        num_encoder_layers: int = 8,  # T5Config.num_layers（encoder_only时只用这个）
-        dropout_rate: float = 0.0,
-        feed_forward_proj: str = "relu",  # T5Config.feed_forward_proj
+        num_encoder_layers: int = 12,  # T5Config.num_layers（encoder_only时只用这个）
+        dropout_rate: float = 0.1,
+        feed_forward_proj: str = "gated-gelu",  # T5Config.feed_forward_proj
         # — 时序切块相关 — #
         seq_len: int = 512,
         patch_len: int = 8,
         patch_stride_len: int = 8,
         # 任务/模型形态 — #
         transformer_type: str = "encoder_only",  # 'encoder_only' | 'decoder_only' | 'encoder_decoder'
-        transformer_backbone: str = "google/flan-t5-large",
+        transformer_backbone: str = "google/flan-t5-base",
         # 训练头与数据形态 — #
         continuous_loads: bool = True,  # 与其他模型接口保持一致；本适配器不使用
         continuous_head: Literal["mse", "huber"] = "huber",
         forecast_horizon: Optional[int] = None,  # 不传则用 max_pred_len
         # MOMENT 其他可选项（保持默认即可从头训练）
-        add_positional_embedding: bool = True,
-        value_embedding_bias: bool = False,
-        revin_affine: bool = False,
-        patch_dropout: float = 0.0,
-        mask_ratio: float = 0.0,
-        enable_gradient_checkpointing: bool = False,
-        randomly_initialize_backbone: bool = True,  # 从头训练：通常置 True
+        randomly_initialize_backbone: bool = True,  # 从头训练
         # 设备 / dtype —— #
         torch_dtype: Optional[torch.dtype] = torch.float32,
         device: Optional[torch.device | str] = "cuda",
@@ -70,32 +64,46 @@ class MomentAsLoadForecastAdapter(nn.Module):
         #   如果 randomly_initialize_backbone: 用 T5Model(model_config)，否则 T5EncoderModel(model_config)
         #   最终取 get_encoder()，因此 encoder_only 场景只需要设置 num_layers（encoder层数）
         t5_config = {
+            "architectures": ["T5ForConditionalGeneration"],
             "d_model": d_model,
             "d_ff": dim_feedforward,
             "num_heads": num_heads,
             "num_layers": num_encoder_layers,
             "dropout_rate": dropout_rate,
             "feed_forward_proj": feed_forward_proj,
-            # 下列字段不是必须；若你在自定义 T5Config 里有用，可在此继续补充：
-            # "layer_norm_epsilon": 1e-6,
-            # "initializer_factor": 1.0,
+            "d_kv": 64,
+            "decoder_start_token_id": 0,
+            "eos_token_id": 1,
+            "initializer_factor": 1.0,
+            "is_encoder_decoder": True,
+            "layer_norm_epsilon": 1e-06,
+            "model_type": "t5",
+            "n_positions": 512,
+            "num_decoder_layers": num_encoder_layers,
+            "output_past": True,
+            "pad_token_id": 0,
+            "relative_attention_max_distance": 128,
+            "relative_attention_num_buckets": 32,
+            "tie_word_embeddings": False,
+            "use_cache": True,
+            "vocab_size": 32128,
         }
 
         model_kwargs = {
             "task_name": TASKS.FORECASTING,
-            "d_model": d_model,
+            "d_model": None,
             "seq_len": seq_len,
             "patch_len": patch_len,
             "patch_stride_len": patch_stride_len,
             "transformer_type": transformer_type,
             "transformer_backbone": transformer_backbone,
             "t5_config": t5_config,
-            "revin_affine": revin_affine,
-            "add_positional_embedding": add_positional_embedding,
-            "value_embedding_bias": value_embedding_bias,
-            "patch_dropout": patch_dropout,
-            "mask_ratio": mask_ratio,
-            "enable_gradient_checkpointing": enable_gradient_checkpointing,
+            # "revin_affine": revin_affine,
+            # "add_positional_embedding": add_positional_embedding,
+            # "value_embedding_bias": value_embedding_bias,
+            # "patch_dropout": patch_dropout,
+            # "mask_ratio": mask_ratio,
+            "enable_gradient_checkpointing": False,
             "randomly_initialize_backbone": randomly_initialize_backbone,
             "forecast_horizon": forecast_horizon or max_pred_len,
             "freeze_embedder": False,
@@ -189,7 +197,7 @@ class MomentAsLoadForecastAdapter(nn.Module):
         return self.moment.parameters()
 
     # ----------------- load checkpoint -------------------
-    def load_from_checkpoint(self, checkpoint_path: str | bytes | os.PathLike):
+    def load_from_checkpoint(self, checkpoint_path: str | os.PathLike):
         """
         兼容以下几种保存方式：
           - {'model': state_dict}
@@ -236,30 +244,16 @@ if __name__ == "__main__":
     pred_len = 24
     max_context_len = 336
     max_pred_len = 168
-    num_encoder_layers = 16
-    num_heads = 12
-    dim_feedforward = 2048
-    d_model = 768
     continuous_loads = True
     continuous_head = "huber"
 
     adapter = MomentAsLoadForecastAdapter(
+        context_len=context_len,
+        pred_len=pred_len,
         max_context_len=max_context_len,
         max_pred_len=max_pred_len,
-        d_model=d_model,
-        dim_feedforward=dim_feedforward,
-        num_heads=num_heads,
-        num_encoder_layers=num_encoder_layers,
-        feed_forward_proj="relu",
-        seq_len=512,  # 注意：决定 num_patches = seq_len/patch_len（当 stride==patch_len）
-        patch_len=8,
-        patch_stride_len=8,
-        transformer_type="encoder_only",
-        transformer_backbone="google/flan-t5-base",
         continuous_loads=continuous_loads,
         continuous_head=continuous_head,
-        randomly_initialize_backbone=True,  # 从头初始化
-        device=device,
     ).train()
 
     count_parameters = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
