@@ -1,4 +1,5 @@
 from typing import Dict, Literal, Optional
+from buildings_bench.models.base_model import BaseModel
 import torch
 from torch import nn
 from torch import Tensor
@@ -942,27 +943,14 @@ class Model(nn.Module):
         return x
 
 
-class LoadForecastingPatchTST_A(nn.Module):
-    """
-    PatchTST 的多地平线封装（做法A：最大长度训练 + 切片/掩码）
-    与 LoadForecastingTransformerMoE 的接口保持一致：
-      - forward(x, context_len=None, pred_len=None)
-      - predict(x, context_len, pred_len)
-      - loss(pred, y)
-      - load_from_checkpoint(...)
-      - unfreeze_and_get_parameters_for_finetuning()
-    输入约定：
-      x["load"]: (B, ctx+pred, 1) 与 MoE 模型一致（同一尺度：通常是 Box-Cox）
-    """
-
+class LoadForecastingPatchTST_A(BaseModel):
     def __init__(
         self,
-        # 对齐 MoE 的构造参数命名
         max_context_len: int = 336,
         max_pred_len: int = 168,
-        context_len: int = 168,  # 默认值，仅作文档用途，forward 可覆盖
-        pred_len: int = 24,  # 默认值，仅作文档用途，forward 可覆盖
-        # PatchTST 主要超参（给出与示例一致的默认）
+        # 下面两个仅用于文档/默认调用，forward/predict 可覆盖
+        context_len: int = 336,
+        pred_len: int = 168,
         e_layers: int = 6,
         n_heads: int = 4,
         d_model: int = 256,
@@ -972,30 +960,33 @@ class LoadForecastingPatchTST_A(nn.Module):
         head_dropout: float = 0.0,
         patch_len: int = 12,
         stride: int = 8,
-        padding_patch: Optional[str] = None,  # or "end"
-        revin: bool = False,  # 是否使用 RevIN 归一化
+        padding_patch: Optional[str] = None,
+        revin: bool = False,
         affine: bool = True,
         subtract_last: bool = False,
-        # 与 MoE 对齐的输出配置
         continuous_loads: bool = True,
         continuous_head: Literal["mse", "gaussian_nll", "huber"] = "huber",
+        huber_delta: float = 1.0,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(
+            context_len=max_context_len,
+            pred_len=max_pred_len,
+            continuous_loads=continuous_loads,
+        )
         self.max_context_len = max_context_len
         self.max_pred_len = max_pred_len
-        self.continuous_loads = continuous_loads
         self.continuous_head = continuous_head
+        self.huber_delta = huber_delta
 
-        # === 内部 PatchTST ===
-        # 关键：把 pred_len 固定为最大地平线（做法A）
+        # PatchTST configs：固定为最大地平线（方案A）
         from easydict import EasyDict as edict
 
         configs = edict(
             dict(
                 enc_in=1,
                 seq_len=max_context_len,
-                pred_len=max_pred_len,  # 固定为最大地平线
+                pred_len=max_pred_len,
                 e_layers=e_layers,
                 n_heads=n_heads,
                 d_model=d_model,
@@ -1012,20 +1003,12 @@ class LoadForecastingPatchTST_A(nn.Module):
                 subtract_last=subtract_last,
             )
         )
-        self.backbone = Model(configs)  # 你前面那段 PatchTST 的 Model
+        self.backbone = Model(configs)
 
-        # 让输出维度与 continuous_head 对齐（1 或 2）
         self.out_dim = 1 if continuous_head in ("mse", "huber") else 2
-        # 由于 PatchTST backbone 输出 [B, L_max, 1]，这里再过一个线性映射到需要的 out_dim
         self.head = nn.Linear(1, self.out_dim)
 
-    # --------------------- utils ----------------------
     def _align_context(self, ctx: torch.Tensor) -> torch.Tensor:
-        """
-        将 (B, ctx, 1) 对齐/裁剪到 (B, max_context_len, 1)
-        - 若 ctx < max_context_len: 左侧复制首值补齐
-        - 若 ctx > max_context_len: 取最后 max_context_len 步
-        """
         B, L, C = ctx.shape
         if L == self.max_context_len:
             return ctx
@@ -1033,114 +1016,94 @@ class LoadForecastingPatchTST_A(nn.Module):
             pad_len = self.max_context_len - L
             pad = ctx[:, :1, :].expand(B, pad_len, C)
             return torch.cat([pad, ctx], dim=1)
-        else:  # L > max_context_len
+        else:
             return ctx[:, -self.max_context_len :, :]
 
-    # --------------------- forward ----------------------
     def forward(
         self,
         x: Dict[str, torch.Tensor],
         context_len: Optional[int] = None,
         pred_len: Optional[int] = None,
     ):
-        """
-        输入：
-          x["load"]: (B, ctx+pred, 1)
-        输出：
-          y_hat: (B, pred_len, out_dim)
-        """
         if context_len is None:
             context_len = self.max_context_len
         if pred_len is None:
             pred_len = self.max_pred_len
+        if pred_len > self.max_pred_len:
+            raise ValueError(
+                f"pred_len({pred_len}) > max_pred_len({self.max_pred_len})"
+            )
 
-        load = x["load"]  # (B, ctx+pred, 1)
-        assert load.dim() == 3 and load.size(-1) == 1, "x['load'] 需要是 (B, T, 1)"
-        assert load.size(1) >= context_len, "load 的时间长度需 >= context_len"
+        load = x["load"]  # (B, T, 1)
+        assert load.dim() == 3 and load.size(-1) == 1
+        assert load.size(1) >= context_len
 
-        # 按你 MoE 的接口做法拿出上下文
-        ctx = load[:, :context_len, :]  # (B, ctx, 1)
-        ctx = self._align_context(ctx)  # (B, max_ctx, 1)
+        ctx = self._align_context(load[:, :context_len, :])  # (B, 336, 1)
+        full_pred = self.backbone(ctx)  # (B, 168, 1)
+        full_pred = self.head(full_pred)  # (B, 168, out_dim)
+        return full_pred[:, :pred_len, :]
 
-        # PatchTST Backbone 计算最大地平线
-        full_pred = self.backbone(ctx)  # (B, L_max, 1)
-        full_pred = self.head(full_pred)  # (B, L_max, out_dim)
-
-        # 切片到当前请求的 pred_len（做法A的核心）
-        y_hat = full_pred[:, :pred_len, :]  # (B, pred_len, out_dim)
-        return y_hat
-
-    # --------------------- loss ----------------------
     def loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        与 MoE 版一致（去掉门控均衡项）：
-          - continuous_head == 'mse' / 'huber'：回归
-          - continuous_head == 'gaussian_nll'：高斯 NLL
-        形状：
-          pred: (B, L, out_dim)；y: (B, L, 1)
-        """
         if not self.continuous_loads:
-            # 如果你有分类场景，也可按需扩展；默认只做连续负荷
             B, L, _ = pred.shape
             return F.cross_entropy(pred.reshape(B * L, -1), y.long().reshape(B * L))
-
         if self.continuous_head == "huber":
-            err = F.huber_loss(pred[..., :1], y, delta=1.0, reduction="none")
-            return err.mean()
+            return F.huber_loss(
+                pred[..., :1], y, delta=self.huber_delta, reduction="mean"
+            )
         elif self.continuous_head == "mse":
-            err = F.mse_loss(pred[..., :1], y, reduction="none")
-            return err.mean()
-        else:  # gaussian_nll
+            return F.mse_loss(pred[..., :1], y, reduction="mean")
+        else:
             mu, sigma_sq = pred[..., :1], F.softplus(pred[..., 1:]) ** 2
-            err = 0.5 * (torch.log(2 * torch.pi * sigma_sq) + (y - mu) ** 2 / sigma_sq)
-            return err.mean()
+            return (
+                0.5 * (torch.log(2 * torch.pi * sigma_sq) + (y - mu) ** 2 / sigma_sq)
+            ).mean()
 
-    # --------------------- predict ----------------------
     @torch.no_grad()
     def predict(
-        self, x: Dict[str, torch.Tensor], context_len: int = 168, pred_len: int = 24
+        self, x: Dict[str, torch.Tensor], context_len: int = 336, pred_len: int = 168
     ):
-        preds = self.forward(x, context_len, pred_len)  # (B, L, out_dim)
+        preds = self.forward(x, context_len, pred_len)
         if self.continuous_head in ("mse", "huber"):
-            return preds[..., :1], preds  # 与 MoE 的 (point, raw) 对齐
+            return preds[..., :1], preds
         else:
-            return preds[..., :1], preds  # mu, [mu, sigma]
+            return preds[..., :1], preds
 
-    # --------------------- 其它接口 ----------------------
     def unfreeze_and_get_parameters_for_finetuning(self):
         return self.parameters()
 
     def load_from_checkpoint(self, checkpoint_path: str, strict: bool = False):
         state = torch.load(checkpoint_path, map_location="cpu")
-        state = state.get("model", state)  # 兼容 {'model': sd} 或直接 sd
+        state = state.get("model", state)
         state = {k.replace("module.", ""): v for k, v in state.items()}
         self.load_state_dict(state, strict=strict)
 
 
 if __name__ == "__main__":
-    from easydict import EasyDict as edict
-
-    configs = edict(
-        {
-            "enc_in": 7,
-            "seq_len": 96,
-            "pred_len": 96,
-            "e_layers": 3,
-            "n_heads": 8,
-            "d_model": 64,
-            "d_ff": 256,
-            "dropout": 0.1,
-            "fc_dropout": 0.1,
-            "head_dropout": 0.1,
-            "individual": False,
-            "patch_len": 12,
-            "stride": 6,
-            "padding_patch": None,
-            "revin": True,
-            "affine": True,
-            "subtract_last": False,
-            "decomposition": True,
-            "kernel_size": 25,
-        }
+    model = LoadForecastingPatchTST_A(
+        max_context_len=336,
+        max_pred_len=168,
+        e_layers=18,
+        n_heads=12,
+        d_model=768,
+        d_ff=2048,
+        dropout=0.0,
+        fc_dropout=0.0,
+        head_dropout=0.0,
+        patch_len=12,
+        stride=8,
+        padding_patch=None,
+        revin=True,
+        affine=True,
+        subtract_last=False,
+        continuous_loads=True,
+        continuous_head="huber",
+        huber_delta=1.0,
     )
-    model = Model(configs)
+    x = torch.randn(16, 400, 1)
+    out = model({"load": x}, context_len=336, pred_len=168)
+    print(out.shape)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters: {n_params}")
+    loss = model.loss(out, torch.randn(16, 168, 1))
+    print(loss)
