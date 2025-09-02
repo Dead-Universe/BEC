@@ -36,11 +36,14 @@ class LoadForecastingTransformerMoE(BaseModel):
         ignore_spatial: bool = False,
         weather_inputs: list | None = None,
         use_dense: bool = False,
+        arch_mode: Literal["encdec", "encoder", "decoder"] = "encdec",
     ):
         super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
         self.max_context_len = max_context_len
         self.max_pred_len = max_pred_len
         self.continuous_head = continuous_head
+        self.arch_mode = arch_mode
+        self.use_dense = use_dense
 
         # ------- 三路编码/解码（结构保持不变） -------
         self.embedding = nn.Linear(1, d_model)
@@ -61,17 +64,17 @@ class LoadForecastingTransformerMoE(BaseModel):
             score_func="softmax",
             route_scale=1.0,
             use_dense=use_dense,
+            arch_mode=arch_mode,
         )
 
-        self.use_dense = use_dense
-
-        enc_layer = Encoder(self.cfg.n_dense_layers, self.cfg)
-        self.encoder = nn.TransformerEncoder(
-            enc_layer, num_encoder_layers + 2, enable_nested_tensor=False
-        )
-
-        dec_layer = Decoder(self.cfg.n_dense_layers, self.cfg)
-        self.decoder = nn.TransformerDecoder(dec_layer, num_decoder_layers + 2)
+        if self.arch_mode == "encoder" or self.arch_mode == "encdec":
+            enc_layer = Encoder(self.cfg.n_dense_layers, self.cfg)
+            self.encoder = nn.TransformerEncoder(
+                enc_layer, num_encoder_layers + 2, enable_nested_tensor=False
+            )
+        if self.arch_mode == "decoder" or self.arch_mode == "encdec":
+            dec_layer = Decoder(self.cfg.n_dense_layers, self.cfg)
+            self.decoder = nn.TransformerDecoder(dec_layer, num_decoder_layers + 2)
 
         out_dim = 1 if continuous_head in ("mse", "huber") else 2
         self.head = nn.Linear(self.cfg.dim, out_dim)
@@ -101,18 +104,44 @@ class LoadForecastingTransformerMoE(BaseModel):
 
         load = x["load"]  # (B, ctx+pred, 1)，与 stl_* 同尺度（Box-Cox）
         assert load.size(1) == context_len + pred_len, "load 长度与 ctx+pred 不一致"
-        ctx = load[:, :context_len]  # (B, ctx, 1)
+        B, _, _ = load.shape
+        ctx = load[:, :context_len]  # [B, ctx, 1]
 
-        mem = self.encoder(self.embedding(ctx))
+        if self.arch_mode == "encdec":
+            # ===== 原始 Encoder-Decoder 路径=====
 
-        B = load.size(0)
-        query = torch.zeros(
-            B, pred_len, self.cfg.dim, device=load.device, dtype=load.dtype
-        )
-        out = self.decoder(query, mem)
+            # 编码器部分
+            mem = self.encoder(self.embedding(ctx))  # 编码器双向可用
+            # 解码器部分
+            query = torch.zeros(
+                B, self.max_pred_len, self.cfg.dim, device=load.device, dtype=load.dtype
+            )
+            out = self.decoder(query, mem)
+            y_hat = self.head(out)
+            return y_hat[:, :pred_len, :]  # 仅取预测段
 
-        y_hat = self.head(out)
-        return y_hat
+        elif self.arch_mode == "encoder":
+            # ===== 纯 Encoder 路径：上下文 + 预测占位零，启用因果掩码 =====
+            zeros_pred = torch.zeros(
+                B, self.max_pred_len, 1, device=load.device, dtype=load.dtype
+            )
+            inp = torch.cat([ctx, zeros_pred], dim=1)  # [B, ctx+pred, 1]
+            h = self.encoder(self.embedding(inp), is_causal=True)  # 关键：因果
+            out = h[:, -self.max_pred_len :, :]  # 仅取预测段
+            return self.head(out)[:, :pred_len, :]
+
+        else:  # self.arch_mode == "decoder"
+            zeros_pred = torch.zeros(
+                B, self.max_pred_len, 1, device=load.device, dtype=load.dtype
+            )
+            tgt_vals = torch.cat([ctx, zeros_pred], dim=1)  # [B, ctx+pred, 1]
+
+            tgt = self.embedding(tgt_vals)  # [B, ctx+pred, D]
+            # 关键：启用因果掩码，保证预测段位置只看见上下文与自己左边的预测占位
+            h = self.decoder(tgt, memory=None, tgt_is_causal=True)
+
+            out = h[:, -self.max_pred_len :, :]  # 仅取预测段
+            return self.head(out)[:, :pred_len, :]  # [B, pred, out_dim]
 
     # --------------------- loss（已移除分解正则） ---------------------
     def loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -260,9 +289,13 @@ if __name__ == "__main__":
 
     model = (
         LoadForecastingTransformerMoE(
-            max_context_len=672,
+            max_context_len=336,
             max_pred_len=168,
             continuous_head="huber",
+            use_dense=True,
+            arch_mode="encdec",
+            num_decoder_layers=1,
+            num_encoder_layers=1,
         )
         .to(device)
         .train()

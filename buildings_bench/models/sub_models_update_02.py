@@ -142,6 +142,7 @@ class ModelArgs(PyBaseModel):
     context_len: int = 168
     pred_len: int = 24
     use_dense: bool = False
+    arch_mode: Literal["encdec", "encoder", "decoder"] = "encdec"
 
     model_config = ConfigDict(
         extra="ignore",  # 多余键直接忽略；改成 "forbid" 可强制报错
@@ -504,12 +505,6 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """
-
-
-    Attributes:
-
-    """
 
     def __init__(self, layer_id: int, args: ModelArgs):
         """
@@ -534,16 +529,17 @@ class Decoder(nn.Module):
                 args.dim, (args.n_activated_experts + 1) * args.moe_inter_dim
             )
         self.norm2 = RMSNorm(args.dim)
-        self.multihead_attn = RoPEMultiheadAttention(
-            embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
-        )
+        if args.arch_mode == "encdec":
+            self.multihead_attn = RoPEMultiheadAttention(
+                embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
+            )
         self.ffn_norm = RMSNorm(args.dim)
         self.ans_norm = RMSNorm(args.dim)
 
     def forward(
         self,
         tgt: torch.Tensor,  # [B, S_tgt, D]
-        memory: torch.Tensor,  # [B, S_src, D] — 编码器输出
+        memory: Optional[torch.Tensor] = None,  # [B, S_src, D] — 编码器输出
         tgt_mask: Optional[torch.Tensor] = None,  # causal mask
         memory_mask: Optional[torch.Tensor] = None,  # padding mask (可选)
         tgt_key_padding_mask: Optional[
@@ -578,18 +574,24 @@ class Decoder(nn.Module):
             is_causal=tgt_is_causal,
         )
         y = tgt + attn_out
-        q = self.norm2(y)
-        k = v = memory
-        cross_out, _ = self.multihead_attn(
-            q,
-            k,
-            v,
-            attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask,
-            need_weights=False,
-            is_causal=memory_is_causal,
-        )
-        z = y + cross_out
+
+        # ===== 关键改动：memory 为空则跳过 cross-attention =====
+        if memory is not None:
+            q = self.norm2(y)
+            k = v = memory
+            cross_out, _ = self.multihead_attn(
+                q,
+                k,
+                v,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=False,
+                is_causal=memory_is_causal,
+            )
+            z = y + cross_out
+        else:
+            z = self.norm2(y)  # 与 enc-dec 情况保持相近的归一化路径
+
         out = z + self.ffn(self.ffn_norm(z))
         return self.ans_norm(out)  # [B, S_tgt, D] 输出
 
