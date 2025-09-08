@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-from typing import List
-
-import torch
+import copy
+import logging
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-
-import copy
-import logging
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
-
+import torch
 import torch.nn as nn
 from transformers.models.t5.modeling_t5 import (
     ACT2FN,
@@ -583,17 +578,15 @@ class ChronosBoltModelForForecasting(T5PreTrainedModel):
         return decoder_outputs.last_hidden_state  # sequence_outputs, b x 1 x d_model
 
 
-from typing import Dict, Optional, Tuple, Literal
+import copy
+from typing import Dict, Literal, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 
 # === 引用你已有的基类与 Chronos 主体 ===
 from buildings_bench.models.base_model import BaseModel
-
-
-import copy
+from torch import nn
 
 
 class ChronosAsLoadForecastAdapter(BaseModel):
@@ -609,18 +602,18 @@ class ChronosAsLoadForecastAdapter(BaseModel):
         max_pred_len: int = 168,
         context_len: int = 168,
         pred_len: int = 24,
-        d_model: int = 256,
-        dim_feedforward: int = 1024,
-        num_encoder_layers: int = 6,  # T5 的 encoder 层数
-        num_decoder_layers: int = 6,  # T5 的 decoder 层数
+        d_model: int = 768,
+        dim_feedforward: int = 3072,
+        num_encoder_layers: int = 12,  # T5 的 encoder 层数
+        num_decoder_layers: int = 12,  # T5 的 decoder 层数
         activation: str = "relu",  # T5Config.feed_forward_proj
-        dropout: float = 0.0,
-        num_heads: int = 8,  # T5Config.num_heads
+        dropout: float = 0.1,
+        num_heads: int = 12,  # T5Config.num_heads
         # —— Chronos 特有（设有合理默认） —— #
-        input_patch_size: int = 24,
-        input_patch_stride: int = 8,
+        input_patch_size: int = 16,
+        input_patch_stride: int = 16,
         quantiles: List[float] = [0.5],
-        use_reg_token: bool = False,
+        use_reg_token: bool = True,
         # —— 训练头部定义（与 MoE 对齐） —— #
         continuous_head: Literal["mse", "gaussian_nll", "huber"] = "huber",
         # torch dtype（可选）
@@ -644,8 +637,23 @@ class ChronosAsLoadForecastAdapter(BaseModel):
             num_decoder_layers=num_decoder_layers,
             dropout_rate=dropout,
             feed_forward_proj=activation,  # 'relu'/'gelu'等
+            dense_act_fn=activation,
             decoder_start_token_id=0,
-            vocab_size=1,
+            classifier_dropout=0.0,
+            vocab_size=2,
+            use_cache=True,
+            eos_token_id=1,
+            initializer_factor=0.05,
+            is_encoder_decoder=True,
+            is_gated_act=False,
+            layer_norm_epsilon=1e-06,
+            model_type="t5",
+            n_positions=512,
+            pad_token_id=0,
+            reg_token_id=1,
+            relative_attention_max_distance=128,
+            relative_attention_num_buckets=32,
+            torch_dtype="float32",
         )
         cfg.chronos_config = {
             "context_length": max_context_len,
@@ -772,23 +780,22 @@ if __name__ == "__main__":
 
     # 1) 构造“像 MoE 一样”的初始化
     adapter = ChronosAsLoadForecastAdapter(
-        max_context_len=672,
+        max_context_len=336,
         max_pred_len=168,
-        context_len=96,  # 本轮实际使用
-        pred_len=40,  # 本轮实际使用
-        d_model=128,
-        dim_feedforward=256,
-        num_encoder_layers=2,
-        num_decoder_layers=2,
-        activation="relu",
-        dropout=0.1,
-        input_patch_size=16,
-        input_patch_stride=8,
-        quantiles=[0.1, 0.5, 0.9],
-        use_reg_token=False,
+        context_len=168,  # 本轮实际使用
+        pred_len=24,  # 本轮实际使用
         continuous_head="huber",
         device=device,
+        dim_feedforward=2048,
+        d_model=512,
+        num_heads=8,
+        num_encoder_layers=6,
+        num_decoder_layers=6,
     ).train()
+
+    count_parameters = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
+
+    print(count_parameters)
 
     # 2) 伪造 batch（键位与 MoE 保持一致）
     ctx, pred = 96, 40
