@@ -7,11 +7,10 @@ finetune_university_cofactor.py
 在 BuildingsBench 的 'university' / 'cofactor' 数据集上，并使用
 DatasetMetricsManager + aggregate 在测试集评估、导出 CSV、打印聚合结果。
 
-- 7:1:2 切分 + 固定随机种子
-- 先加载预训练权重（--pretrained_path），再微调（通过模型的
-  unfreeze_and_get_parameters_for_finetuning 控制可训练参数）
-- 训练保存完整快照（模型/优化器/调度器/step/best），测试加载“验证集最优”
-- Box-Cox 时尽量回到实量纲评测
+修正：
+- DataLoader 不再应用 Box-Cox 转换
+- 训练/验证时手动 transform 到 Box-Cox 空间
+- 测试/评估时 inverse_transform 回到实量纲
 """
 
 import argparse
@@ -46,7 +45,6 @@ from buildings_bench.evaluation.managers import BuildingTypes, DatasetMetricsMan
 def _adapt_module_prefix(
     model: torch.nn.Module, state_dict: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """自适配 DataParallel 的 'module.' 前缀差异。"""
     model_has_module = next(iter(model.state_dict().keys()), "").startswith("module.")
     ckpt_has_module = any(k.startswith("module.") for k in state_dict.keys())
     if model_has_module and not ckpt_has_module:
@@ -65,9 +63,6 @@ def save_model_checkpoint(
     path: str | Path,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    友好的保存：总会保存 'model'，optimizer/scheduler 可为 None。
-    """
     import math as _m
 
     checkpoint = {
@@ -92,11 +87,6 @@ def load_model_checkpoint(
     strict: bool = False,
     model_key_candidates: Tuple[str, ...] = ("model", "model_state", "state_dict"),
 ) -> Tuple[int, float]:
-    """
-    友好的加载：优先从 checkpoint['model'|'model_state'|'state_dict'] 取权重，
-    自动适配 module. 前缀；若提供 optimizer/scheduler 且 ckpt 中存在则一并恢复。
-    返回 (step, best_val_loss)；若缺失则 (0, inf)。
-    """
     if isinstance(path, Path):
         path = str(path)
 
@@ -107,7 +97,7 @@ def load_model_checkpoint(
 
     ckpt = torch.load(path, map_location=map_loc)
 
-    # 1) 模型权重
+    # 模型权重
     sd = None
     if isinstance(ckpt, dict):
         for k in model_key_candidates:
@@ -115,7 +105,6 @@ def load_model_checkpoint(
                 sd = ckpt[k]
                 break
         if sd is None:
-            # 极简存法：ckpt 本身就是 state_dict
             if ckpt and all(hasattr(v, "shape") for v in ckpt.values()):
                 sd = ckpt
     if sd is None:
@@ -124,7 +113,7 @@ def load_model_checkpoint(
     sd = _adapt_module_prefix(model, sd)
     model.load_state_dict(sd, strict=strict)
 
-    # 2) 可选恢复优化器/调度器
+    # 可选恢复优化器/调度器
     if optimizer is not None:
         opt_sd = ckpt.get("optimizer", None) if isinstance(ckpt, dict) else None
         if isinstance(opt_sd, dict) and len(opt_sd) > 0:
@@ -141,7 +130,6 @@ def load_model_checkpoint(
             except Exception as e:
                 print(f"[load_model_checkpoint] scheduler state not loaded: {e}")
 
-    # 3) meta
     step = int(ckpt.get("step", 0)) if isinstance(ckpt, dict) else 0
     best_val_loss = (
         float(ckpt.get("best_val_loss", float("inf")))
@@ -154,7 +142,6 @@ def load_model_checkpoint(
 def load_pretrained_if_any(
     model: torch.nn.Module, pretrained_path: Optional[str | Path], device: str
 ) -> None:
-    """优先使用 BaseModel 的 load_from_checkpoint；否则尝试直接读 state_dict。"""
     if not pretrained_path:
         return
     try:
@@ -184,7 +171,6 @@ def fixed_len_collate(batch, ctx_len: int, pred_len: int) -> Dict[str, Any]:
         return out if dtype is None else out.to(dtype)
 
     merged: Dict[str, Any] = {"load": _stack("load", torch.float32)}
-    # 并入其他张量字段（若存在且为张量/nd数组）
     for k in batch[0]:
         if k != "load":
             v = batch[0][k]
@@ -196,9 +182,35 @@ def fixed_len_collate(batch, ctx_len: int, pred_len: int) -> Dict[str, Any]:
     return merged
 
 
+def make_safe_transformers(transform, inverse_transform):
+    """包装 transform / inverse_transform，自动处理 torch.Tensor / GPU"""
+
+    def safe_transform(x: torch.Tensor) -> torch.Tensor:
+        if transform is None:
+            return x
+        if isinstance(x, torch.Tensor):
+            x_np = x.detach().cpu().numpy()
+            out = transform(x_np)
+            return torch.from_numpy(out).to(x.device)
+        else:
+            return transform(x)
+
+    def safe_inverse_transform(x: torch.Tensor) -> torch.Tensor:
+        if inverse_transform is None:
+            return x
+        if isinstance(x, torch.Tensor):
+            x_np = x.detach().cpu().numpy()
+            out = inverse_transform(x_np)
+            return torch.from_numpy(out).to(x.device)
+        else:
+            return inverse_transform(x)
+
+    return safe_transform, safe_inverse_transform
+
+
 @torch.no_grad()
-def quick_eval_rmse_mae(model, loader, device) -> Tuple[float, float]:
-    """训练监控用的简易 RMSE/MAE（在当前缩放空间上）。"""
+def quick_eval_rmse_mae(model, loader, device, transform) -> Tuple[float, float]:
+    """在 transform 空间上的 RMSE/MAE"""
     model.eval()
     se_sum, ae_sum, n_tok = 0.0, 0.0, 0
     for batch in loader:
@@ -208,6 +220,8 @@ def quick_eval_rmse_mae(model, loader, device) -> Tuple[float, float]:
 
         ctx_len = int(batch.pop("context_len"))
         pred_len = int(batch.pop("pred_len"))
+
+        batch["load"] = transform(batch["load"])
 
         preds = model(batch, context_len=ctx_len, pred_len=pred_len)
         tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
@@ -231,7 +245,6 @@ def build_dataloaders(
     seed: int,
     num_workers: int,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    # 7:1:2 切分
     N = len(full_ds)
     n_train = int(0.7 * N)
     n_val = int(0.1 * N)
@@ -281,9 +294,10 @@ def test_with_metrics_manager_and_aggregate(
     test_loader: DataLoader,
     device: str,
     results_dir: Path,
+    transform=lambda x: x,
+    inverse_transform=lambda x: x,
     variant_name: str = "",
 ):
-    # 选择是否计算 scoring rule
     if args.ignore_scoring_rules:
         metrics_manager = DatasetMetricsManager()
     elif getattr(model, "continuous_loads", True):
@@ -296,28 +310,15 @@ def test_with_metrics_manager_and_aggregate(
             scoring_rule=scoring_rule_factory("rps")
         )
 
-    # 反变换（Box-Cox 时尽量回到实量纲）
-    inverse_transform = lambda x: x
-    if args.apply_scaler_transform == "boxcox":
-        try:
-            tpath = Path(os.getenv("BUILDINGS_BENCH", "")) / "metadata" / "transforms"
-            scaler = BoxCoxTransform()
-            scaler.load(tpath)
-            inverse_transform = scaler.undo_transform
-        except Exception:
-            print("!! 警告：BoxCox 反变换加载失败，将在缩放空间计算指标。")
-
     model.eval()
     dataset_name = args.dataset
-    building_id_counter = 0  # 当测试集未显式分楼宇时，生成唯一ID
+    building_id_counter = 0
 
     for batch in test_loader:
-        # building_type 掩码：若无该字段或形状不匹配，则默认全 True（不过滤）
         if "building_type" in batch and isinstance(
             batch["building_type"], torch.Tensor
         ):
             bt = batch["building_type"]
-            # 兼容 [B], [B,1] 或与 load 同形的情况（逐维压到 [B]）
             while bt.ndim > 1:
                 bt = bt.select(-1, 0)
             try:
@@ -335,42 +336,39 @@ def test_with_metrics_manager_and_aggregate(
         ctx_len = int(batch.pop("context_len"))
         pred_len = int(batch.pop("pred_len"))
 
-        out = model(batch, context_len=ctx_len, pred_len=pred_len)
+        trans_batch = {k: v for k, v in batch.items()}
+        trans_batch["load"] = transform(batch["load"])
+
+        out = model(trans_batch, context_len=ctx_len, pred_len=pred_len)
         if isinstance(out, tuple) and len(out) == 2:
             preds, distribution_params = out
         else:
             preds, distribution_params = out, None
 
-        # 目标（连续空间）
         y_true = (
             batch["load"][:, ctx_len : ctx_len + pred_len, 0]
             if batch["load"].ndim == 3
             else batch["load"][:, ctx_len : ctx_len + pred_len]
         )
 
-        # 回到实量纲（若可用）
         preds = preds.detach().float().cpu()
         y_true = y_true.detach().float().cpu()
         try:
             preds = inverse_transform(preds)
-            y_true = inverse_transform(y_true)
         except Exception:
             pass
 
-        # 分布参数（仅 gaussian_nll 头传入）
         if getattr(model, "continuous_head", "") != "gaussian_nll":
             distribution_params = None
         else:
             if isinstance(distribution_params, torch.Tensor):
                 distribution_params = distribution_params.detach().float().cpu()
 
-        # [B, H]
         if preds.ndim == 3 and preds.size(-1) == 1:
             preds = preds.squeeze(-1)
         if y_true.ndim == 3 and y_true.size(-1) == 1:
             y_true = y_true.squeeze(-1)
 
-        # 将一个 batch 切成单楼宇条目喂给 metrics_manager
         bsz = preds.size(0)
         for i in range(bsz):
             building_id_counter += 1
@@ -382,9 +380,9 @@ def test_with_metrics_manager_and_aggregate(
             metrics_manager(
                 dataset_name,
                 building_name,
-                y_true[i : i + 1],  # [1, H]
-                preds[i : i + 1],  # [1, H]
-                mask_i.unsqueeze(0),  # [1]
+                y_true[i : i + 1],
+                preds[i : i + 1],
+                mask_i.unsqueeze(0),
                 y_categories=None,
                 y_distribution_params=(
                     distribution_params[i : i + 1]
@@ -394,7 +392,6 @@ def test_with_metrics_manager_and_aggregate(
                 centroids=None,
             )
 
-    # === 汇总并写 CSV ===
     results_dir.mkdir(parents=True, exist_ok=True)
     variant = f":{variant_name}" if variant_name else ""
     metrics_file = results_dir / f"metrics_{args.model}{variant}.csv"
@@ -412,8 +409,9 @@ def test_with_metrics_manager_and_aggregate(
         metrics_df.to_csv(metrics_file, index=False)
         print(f"[Results] metrics -> {metrics_file}")
 
-    # === 使用 aggregate.return_aggregate 打印聚合结果（median / mean） ===
     model_tag = f"{args.model}{variant}"
+    print(model_tag)
+    print(args.model)
     metric_names = [m.name for m in metrics_manager.metrics_list]
     if metrics_manager.scoring_rule:
         metric_names += [metrics_manager.scoring_rule.name]
@@ -422,7 +420,7 @@ def test_with_metrics_manager_and_aggregate(
     real_med = aggregate.return_aggregate(
         model_list=[model_tag],
         results_dir=str(results_dir),
-        experiment=args.experiment_tag,  # 默认 "zero_shot"，与既有工具兼容
+        experiment=args.experiment_tag,
         metrics=metric_names,
         aggregate="median",
         exclude_simulated=True,
@@ -503,7 +501,6 @@ cofactor_type: dict[str, list[str]] = {
 def main(args, model_args: Dict):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 固定随机性
     utils.set_seed(args.random_seed)
     try:
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -512,16 +509,9 @@ def main(args, model_args: Dict):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # 加载数据
-    # loader 期望 "", "standard", "boxcox" 三种字符串，不传 None
-    scaler_flag = args.apply_scaler_transform
-
-    # 仅在 BUILDINGS_BENCH 存在时显式传路径；否则交给数据管线默认逻辑
     _bb = os.environ.get("BUILDINGS_BENCH")
     dataset_path = Path(_bb) if _bb else None
-    scaler_transform_path = (Path(_bb) / "metadata" / "transforms") if _bb else None
 
-    # 1) 获取“按楼栋生成器”的集合
     if args.dataset.startswith("cofactor:"):
         dataset_name = "cofactor"
     else:
@@ -531,13 +521,9 @@ def main(args, model_args: Dict):
         dataset_path=dataset_path,
         context_len=args.ctx_len,
         pred_len=args.pred_len,
-        apply_scaler_transform=scaler_flag,
-        scaler_transform_path=scaler_transform_path,
     )
-    # 2) 收集成可下标数据集
     ds_list = []
     for bid, bldg_ds in gen:
-        # 如果 dataset 是 cofactor:Type，就过滤 building_id
         if args.dataset.startswith("cofactor:"):
             subtype = args.dataset.split(":", 1)[1]
             allow = set(cofactor_type.get(subtype, []))
@@ -545,10 +531,9 @@ def main(args, model_args: Dict):
                 continue
         ds_list.append(bldg_ds)
     if len(ds_list) == 0:
-        raise RuntimeError("空数据集：未从生成器中收集到任何楼栋子数据集")
+        raise RuntimeError("空数据集：未收集到任何楼栋子数据集")
     full_ds = ConcatDataset(ds_list)
 
-    # 3) 现在可以索引与断言
     sample0 = full_ds[0]
     assert "load" in sample0, "样本缺少 'load' 键"
     assert len(sample0["load"]) >= args.ctx_len + args.pred_len, "序列长度不足"
@@ -562,23 +547,33 @@ def main(args, model_args: Dict):
         args.num_workers,
     )
 
+    # === 准备 BoxCox transform/inverse ===
+    transform = lambda x: x
+    inverse_transform = lambda x: x
+    if args.apply_scaler_transform == "boxcox":
+        try:
+            tpath = Path(os.getenv("BUILDINGS_BENCH", "")) / "metadata" / "transforms"
+            scaler = BoxCoxTransform()
+            scaler.load(tpath)
+            transform = scaler.transform
+            inverse_transform = scaler.undo_transform
+            transform, inverse_transform = make_safe_transformers(
+                transform, inverse_transform
+            )
+            print(">> BoxCoxTransform 已加载")
+        except Exception as e:
+            print(f"!! BoxCoxTransform 加载失败：{e}")
+
     # 构建模型
     model, loss_fn, _ = model_factory(args.model, model_args)
     model = model.to(device)
-
-    # 如提供预训练路径：优先加载（适用于 BuildMoE 等 BaseModel）
     load_pretrained_if_any(model, args.pretrained_path, device)
 
-    # 通过模型方法得到可训练参数（冻结/解冻由模型内部控制）
     params = model.unfreeze_and_get_parameters_for_finetuning()
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-
-    # 恒等 LR 调度器（保证可保存/可恢复）
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
-
     criterion = getattr(model, "loss", None) or loss_fn
 
-    # 训练
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_ckpt = ckpt_dir / f"{args.dataset}_{args.model}_{args.pred_len}_best.pt"
@@ -587,56 +582,53 @@ def main(args, model_args: Dict):
     print(
         f"==> Train | dataset={args.dataset} model={args.model} ctx={args.ctx_len} "
         f"pred={args.pred_len} bs={args.batch_size} lr={args.lr} wd={args.weight_decay} "
-        f"scaler={scaler_flag} seed={args.random_seed} pretrained={bool(args.pretrained_path)}"
+        f"scaler={args.apply_scaler_transform} seed={args.random_seed} pretrained={bool(args.pretrained_path)}"
     )
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        total_loss = 0.0
+    # for epoch in range(1, args.epochs + 1):
+    #     model.train()
+    #     total_loss = 0.0
+    #     for batch in train_loader:
+    #         for k, v in list(batch.items()):
+    #             if isinstance(v, torch.Tensor):
+    #                 batch[k] = v.to(device)
+    #         ctx_len = int(batch.pop("context_len"))
+    #         pred_len = int(batch.pop("pred_len"))
 
-        for batch in train_loader:
-            for k, v in list(batch.items()):
-                if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(device)
-            ctx_len = int(batch.pop("context_len"))
-            pred_len = int(batch.pop("pred_len"))
+    #         batch["load"] = transform(batch["load"])
 
-            preds = model(batch, context_len=ctx_len, pred_len=pred_len)
-            tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
+    #         preds = model(batch, context_len=ctx_len, pred_len=pred_len)
+    #         tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
 
-            loss = criterion(preds, tgt)
-            optimizer.zero_grad()
-            loss.backward()
-            # 兼容多 param group 的裁剪
-            for g in optimizer.param_groups:
-                torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
-            optimizer.step()
+    #         loss = criterion(preds, tgt)
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         for g in optimizer.param_groups:
+    #             torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
+    #         optimizer.step()
+    #         total_loss += loss.item()
 
-            total_loss += loss.item()
+    #     scheduler.step()
+    #     avg_loss = total_loss / max(1, len(train_loader))
+    #     val_rmse, val_mae = quick_eval_rmse_mae(model, val_loader, device, transform)
+    #     print(
+    #         f"[Epoch {epoch:03d}] train_loss={avg_loss:.6f} val_RMSE={val_rmse:.6f} val_MAE={val_mae:.6f}"
+    #     )
 
-        scheduler.step()  # 即便恒等，也确保 state_dict 演进一次
+    #     if val_rmse < best_val - 1e-9:
+    #         best_val, best_epoch, no_improve = val_rmse, epoch, 0
+    #         save_model_checkpoint(
+    #             model, optimizer, scheduler, epoch, best_val, best_ckpt
+    #         )
+    #         print(f"  >> Saved best -> {best_ckpt} (val_RMSE={best_val:.6f})")
+    #     else:
+    #         no_improve += 1
+    #         if args.patience > 0 and no_improve >= args.patience:
+    #             print(
+    #                 f"==> Early stop at epoch {epoch}, best@{best_epoch}={best_val:.6f}"
+    #             )
+    #             break
 
-        avg_loss = total_loss / max(1, len(train_loader))
-        val_rmse, val_mae = quick_eval_rmse_mae(model, val_loader, device)
-        print(
-            f"[Epoch {epoch:03d}] train_loss={avg_loss:.6f} val_RMSE={val_rmse:.6f} val_MAE={val_mae:.6f}"
-        )
-
-        if val_rmse < best_val - 1e-9:
-            best_val, best_epoch, no_improve = val_rmse, epoch, 0
-            save_model_checkpoint(
-                model, optimizer, scheduler, epoch, best_val, best_ckpt
-            )
-            print(f"  >> Saved best -> {best_ckpt} (val_RMSE={best_val:.6f})")
-        else:
-            no_improve += 1
-            if args.patience > 0 and no_improve >= args.patience:
-                print(
-                    f"==> Early stop at epoch {epoch}, best@{best_epoch}={best_val:.6f}"
-                )
-                break
-
-    # 测试：加载最佳（若失败会抛异常；可按需 try/except）
     _step, _best = load_model_checkpoint(
         best_ckpt,
         model,
@@ -647,11 +639,9 @@ def main(args, model_args: Dict):
         strict=False,
     )
 
-    # 先打印简易 RMSE/MAE（缩放空间）
-    test_rmse, test_mae = quick_eval_rmse_mae(model, test_loader, device)
+    test_rmse, test_mae = quick_eval_rmse_mae(model, test_loader, device, transform)
     print(f"[Test@Best] RMSE={test_rmse:.6f} MAE={test_mae:.6f}")
 
-    # 正式出表 + 聚合
     results_dir = Path(args.results_path)
     test_with_metrics_manager_and_aggregate(
         args=args,
@@ -659,6 +649,8 @@ def main(args, model_args: Dict):
         test_loader=test_loader,
         device=device,
         results_dir=results_dir,
+        transform=transform,
+        inverse_transform=inverse_transform,
         variant_name=args.variant_name,
     )
 
@@ -681,7 +673,7 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--patience", type=int, default=0, help="早停轮数；0 表示禁用")
+    p.add_argument("--patience", type=int, default=0)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--ckpt_dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--results_path", type=Path, default=Path("results"))
@@ -690,30 +682,20 @@ if __name__ == "__main__":
         "--experiment_tag",
         type=str,
         default="zero_shot",
-        help="aggregate 用的 experiment 标签（与既有工具目录对齐）",
+        help="aggregate 用的 experiment 标签",
     )
     p.add_argument(
         "--apply_scaler_transform",
         choices=["", "standard", "boxcox"],
         default="boxcox",
-        help="'' 表示不使用 scaler；Box-Cox 时会尝试反变换到实量纲评测",
+        help="Box-Cox 时会 transform 训练目标，inverse 测试输出",
     )
     p.add_argument("--random_seed", type=int, default=42)
-    p.add_argument(
-        "--pretrained_path",
-        type=str,
-        default="",
-        help="可选：预训练 checkpoint 路径（适用于 BuildMoE 等 BaseModel）",
-    )
-    p.add_argument(
-        "--ignore_scoring_rules",
-        action="store_true",
-        help="评测时不计算 CRPS/RPS（仅基础指标）",
-    )
+    p.add_argument("--pretrained_path", type=str, default="")
+    p.add_argument("--ignore_scoring_rules", action="store_true")
 
     args = p.parse_args()
 
-    # === 读取模型配置（包资源优先，回退到本地项目路径）===
     try:
         with ir.files("buildings_bench.configs").joinpath(f"{args.model}.toml").open(
             "rb"
@@ -726,7 +708,6 @@ if __name__ == "__main__":
             toml_cfg = tomli.load(f)
 
     model_args: Dict = toml_cfg["model"]
-
     model_args["context_len"] = args.ctx_len
     model_args["pred_len"] = args.pred_len
 
