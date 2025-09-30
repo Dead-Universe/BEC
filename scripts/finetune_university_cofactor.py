@@ -1,0 +1,733 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+finetune_university_cofactor.py
+
+微调 BuildMoE / DLinearRegression（或其他基于 BaseModel 的模型）
+在 BuildingsBench 的 'university' / 'cofactor' 数据集上，并使用
+DatasetMetricsManager + aggregate 在测试集评估、导出 CSV、打印聚合结果。
+
+- 7:1:2 切分 + 固定随机种子
+- 先加载预训练权重（--pretrained_path），再微调（通过模型的
+  unfreeze_and_get_parameters_for_finetuning 控制可训练参数）
+- 训练保存完整快照（模型/优化器/调度器/step/best），测试加载“验证集最优”
+- Box-Cox 时尽量回到实量纲评测
+"""
+
+import argparse
+import math
+import os
+from pathlib import Path
+from typing import Dict, Tuple, Optional, Any
+
+import torch
+from torch.utils.data import DataLoader, random_split, ConcatDataset
+
+# ---- tomli/tomllib 兼容 ----
+try:
+    import tomllib as tomli  # py3.11+
+except ModuleNotFoundError:
+    import tomli  # py3.10-
+
+import importlib.resources as ir
+
+# BuildingsBench 组件
+from buildings_bench import utils
+from buildings_bench.data import load_torch_dataset
+from buildings_bench.models import model_factory
+from buildings_bench.transforms import BoxCoxTransform
+from buildings_bench.evaluation import scoring_rule_factory, aggregate
+from buildings_bench.evaluation.managers import BuildingTypes, DatasetMetricsManager
+
+
+# =========================
+#  Checkpoint I/O（健壮版）
+# =========================
+def _adapt_module_prefix(
+    model: torch.nn.Module, state_dict: Dict[str, Any]
+) -> Dict[str, Any]:
+    """自适配 DataParallel 的 'module.' 前缀差异。"""
+    model_has_module = next(iter(model.state_dict().keys()), "").startswith("module.")
+    ckpt_has_module = any(k.startswith("module.") for k in state_dict.keys())
+    if model_has_module and not ckpt_has_module:
+        return {f"module.{k}": v for k, v in state_dict.items()}
+    if (not model_has_module) and ckpt_has_module:
+        return {k[len("module.") :]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def save_model_checkpoint(
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    step: int,
+    best_val_loss: float,
+    path: str | Path,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    友好的保存：总会保存 'model'，optimizer/scheduler 可为 None。
+    """
+    import math as _m
+
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else {},
+        "scheduler": scheduler.state_dict() if scheduler is not None else {},
+        "step": int(step),
+        "best_val_loss": float(best_val_loss if _m.isfinite(best_val_loss) else 1e30),
+        "extra": extra or {},
+    }
+    torch.save(checkpoint, str(path))
+
+
+def load_model_checkpoint(
+    path: str | Path,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    *,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    local_rank: Optional[int] = None,
+    strict: bool = False,
+    model_key_candidates: Tuple[str, ...] = ("model", "model_state", "state_dict"),
+) -> Tuple[int, float]:
+    """
+    友好的加载：优先从 checkpoint['model'|'model_state'|'state_dict'] 取权重，
+    自动适配 module. 前缀；若提供 optimizer/scheduler 且 ckpt 中存在则一并恢复。
+    返回 (step, best_val_loss)；若缺失则 (0, inf)。
+    """
+    if isinstance(path, Path):
+        path = str(path)
+
+    if device.startswith("cuda") and torch.cuda.is_available():
+        map_loc = f"cuda:{local_rank if local_rank is not None else torch.cuda.current_device()}"
+    else:
+        map_loc = "cpu"
+
+    ckpt = torch.load(path, map_location=map_loc)
+
+    # 1) 模型权重
+    sd = None
+    if isinstance(ckpt, dict):
+        for k in model_key_candidates:
+            if k in ckpt and isinstance(ckpt[k], dict):
+                sd = ckpt[k]
+                break
+        if sd is None:
+            # 极简存法：ckpt 本身就是 state_dict
+            if ckpt and all(hasattr(v, "shape") for v in ckpt.values()):
+                sd = ckpt
+    if sd is None:
+        raise ValueError(f"Cannot find model state_dict in checkpoint: {path}")
+
+    sd = _adapt_module_prefix(model, sd)
+    model.load_state_dict(sd, strict=strict)
+
+    # 2) 可选恢复优化器/调度器
+    if optimizer is not None:
+        opt_sd = ckpt.get("optimizer", None) if isinstance(ckpt, dict) else None
+        if isinstance(opt_sd, dict) and len(opt_sd) > 0:
+            try:
+                optimizer.load_state_dict(opt_sd)
+            except Exception as e:
+                print(f"[load_model_checkpoint] optimizer state not loaded: {e}")
+
+    if scheduler is not None:
+        sch_sd = ckpt.get("scheduler", None) if isinstance(ckpt, dict) else None
+        if isinstance(sch_sd, dict) and len(sch_sd) > 0:
+            try:
+                scheduler.load_state_dict(sch_sd)
+            except Exception as e:
+                print(f"[load_model_checkpoint] scheduler state not loaded: {e}")
+
+    # 3) meta
+    step = int(ckpt.get("step", 0)) if isinstance(ckpt, dict) else 0
+    best_val_loss = (
+        float(ckpt.get("best_val_loss", float("inf")))
+        if isinstance(ckpt, dict)
+        else float("inf")
+    )
+    return step, best_val_loss
+
+
+def load_pretrained_if_any(
+    model: torch.nn.Module, pretrained_path: Optional[str | Path], device: str
+) -> None:
+    """优先使用 BaseModel 的 load_from_checkpoint；否则尝试直接读 state_dict。"""
+    if not pretrained_path:
+        return
+    try:
+        if hasattr(model, "load_from_checkpoint"):
+            model.load_from_checkpoint(str(pretrained_path))
+            print(
+                f"[Pretrained] loaded via model.load_from_checkpoint: {pretrained_path}"
+            )
+        else:
+            _ = load_model_checkpoint(
+                pretrained_path, model, optimizer=None, scheduler=None, device=device
+            )
+            print(f"[Pretrained] loaded state_dict from: {pretrained_path}")
+    except Exception as e:
+        print(f"[Pretrained] failed to load ({pretrained_path}): {e}")
+
+
+# =========================
+#  Data / Collate / Eval
+# =========================
+def fixed_len_collate(batch, ctx_len: int, pred_len: int) -> Dict[str, Any]:
+    seq_len = ctx_len + pred_len
+
+    def _stack(key, dtype=None):
+        ts = [torch.as_tensor(s[key][:seq_len]) for s in batch]
+        out = torch.stack(ts)
+        return out if dtype is None else out.to(dtype)
+
+    merged: Dict[str, Any] = {"load": _stack("load", torch.float32)}
+    # 并入其他张量字段（若存在且为张量/nd数组）
+    for k in batch[0]:
+        if k != "load":
+            v = batch[0][k]
+            if isinstance(v, torch.Tensor) or hasattr(v, "shape"):
+                merged[k] = _stack(k, torch.float32)
+    merged["context_len"] = torch.tensor(ctx_len)
+    merged["pred_len"] = torch.tensor(pred_len)
+    merged["building_id"] = [s["building_id"] for s in batch]
+    return merged
+
+
+@torch.no_grad()
+def quick_eval_rmse_mae(model, loader, device) -> Tuple[float, float]:
+    """训练监控用的简易 RMSE/MAE（在当前缩放空间上）。"""
+    model.eval()
+    se_sum, ae_sum, n_tok = 0.0, 0.0, 0
+    for batch in loader:
+        for k, v in list(batch.items()):
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(device)
+
+        ctx_len = int(batch.pop("context_len"))
+        pred_len = int(batch.pop("pred_len"))
+
+        preds = model(batch, context_len=ctx_len, pred_len=pred_len)
+        tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
+
+        err = preds - tgt
+        se_sum += (err**2).sum().item()
+        ae_sum += err.abs().sum().item()
+        n_tok += err.numel()
+
+    rmse = math.sqrt(se_sum / n_tok)
+    mae = ae_sum / n_tok
+    model.train()
+    return rmse, mae
+
+
+def build_dataloaders(
+    full_ds,
+    ctx_len: int,
+    pred_len: int,
+    batch_size: int,
+    seed: int,
+    num_workers: int,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    # 7:1:2 切分
+    N = len(full_ds)
+    n_train = int(0.7 * N)
+    n_val = int(0.1 * N)
+    n_test = N - n_train - n_val
+    g = torch.Generator().manual_seed(seed)
+    train_ds, val_ds, test_ds = random_split(
+        full_ds, [n_train, n_val, n_test], generator=g
+    )
+
+    collate_fn = lambda batch: fixed_len_collate(batch, ctx_len, pred_len)
+    worker_kwargs = dict(num_workers=max(0, int(num_workers)), pin_memory=True)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+        **worker_kwargs,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=collate_fn,
+        **worker_kwargs,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=collate_fn,
+        **worker_kwargs,
+    )
+    return train_loader, val_loader, test_loader
+
+
+# =========================
+#  正式测试：出表 + 聚合
+# =========================
+@torch.no_grad()
+def test_with_metrics_manager_and_aggregate(
+    args,
+    model,
+    test_loader: DataLoader,
+    device: str,
+    results_dir: Path,
+    variant_name: str = "",
+):
+    # 选择是否计算 scoring rule
+    if args.ignore_scoring_rules:
+        metrics_manager = DatasetMetricsManager()
+    elif getattr(model, "continuous_loads", True):
+        use_crps = getattr(model, "continuous_head", "") == "gaussian_nll"
+        metrics_manager = DatasetMetricsManager(
+            scoring_rule=(scoring_rule_factory("crps") if use_crps else None)
+        )
+    else:
+        metrics_manager = DatasetMetricsManager(
+            scoring_rule=scoring_rule_factory("rps")
+        )
+
+    # 反变换（Box-Cox 时尽量回到实量纲）
+    inverse_transform = lambda x: x
+    if args.apply_scaler_transform == "boxcox":
+        try:
+            tpath = Path(os.getenv("BUILDINGS_BENCH", "")) / "metadata" / "transforms"
+            scaler = BoxCoxTransform()
+            scaler.load(tpath)
+            inverse_transform = scaler.undo_transform
+        except Exception:
+            print("!! 警告：BoxCox 反变换加载失败，将在缩放空间计算指标。")
+
+    model.eval()
+    dataset_name = args.dataset
+    building_id_counter = 0  # 当测试集未显式分楼宇时，生成唯一ID
+
+    for batch in test_loader:
+        # building_type 掩码：若无该字段或形状不匹配，则默认全 True（不过滤）
+        if "building_type" in batch and isinstance(
+            batch["building_type"], torch.Tensor
+        ):
+            bt = batch["building_type"]
+            # 兼容 [B], [B,1] 或与 load 同形的情况（逐维压到 [B]）
+            while bt.ndim > 1:
+                bt = bt.select(-1, 0)
+            try:
+                commercial_val = getattr(BuildingTypes, "COMMERCIAL_INT", 1)
+                building_types_mask = (bt == commercial_val).bool().cpu()
+            except Exception:
+                building_types_mask = (bt > 0).bool().cpu()
+        else:
+            building_types_mask = torch.ones(batch["load"].shape[0], dtype=torch.bool)
+
+        for k, v in list(batch.items()):
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(device)
+
+        ctx_len = int(batch.pop("context_len"))
+        pred_len = int(batch.pop("pred_len"))
+
+        out = model(batch, context_len=ctx_len, pred_len=pred_len)
+        if isinstance(out, tuple) and len(out) == 2:
+            preds, distribution_params = out
+        else:
+            preds, distribution_params = out, None
+
+        # 目标（连续空间）
+        y_true = (
+            batch["load"][:, ctx_len : ctx_len + pred_len, 0]
+            if batch["load"].ndim == 3
+            else batch["load"][:, ctx_len : ctx_len + pred_len]
+        )
+
+        # 回到实量纲（若可用）
+        preds = preds.detach().float().cpu()
+        y_true = y_true.detach().float().cpu()
+        try:
+            preds = inverse_transform(preds)
+            y_true = inverse_transform(y_true)
+        except Exception:
+            pass
+
+        # 分布参数（仅 gaussian_nll 头传入）
+        if getattr(model, "continuous_head", "") != "gaussian_nll":
+            distribution_params = None
+        else:
+            if isinstance(distribution_params, torch.Tensor):
+                distribution_params = distribution_params.detach().float().cpu()
+
+        # [B, H]
+        if preds.ndim == 3 and preds.size(-1) == 1:
+            preds = preds.squeeze(-1)
+        if y_true.ndim == 3 and y_true.size(-1) == 1:
+            y_true = y_true.squeeze(-1)
+
+        # 将一个 batch 切成单楼宇条目喂给 metrics_manager
+        bsz = preds.size(0)
+        for i in range(bsz):
+            building_id_counter += 1
+            if "building_id" in batch:
+                building_name = f"{batch['building_id'][i]}"
+            else:
+                building_name = f"{dataset_name}-b{building_id_counter:06d}"
+            mask_i = building_types_mask[i]
+            metrics_manager(
+                dataset_name,
+                building_name,
+                y_true[i : i + 1],  # [1, H]
+                preds[i : i + 1],  # [1, H]
+                mask_i.unsqueeze(0),  # [1]
+                y_categories=None,
+                y_distribution_params=(
+                    distribution_params[i : i + 1]
+                    if isinstance(distribution_params, torch.Tensor)
+                    else None
+                ),
+                centroids=None,
+            )
+
+    # === 汇总并写 CSV ===
+    results_dir.mkdir(parents=True, exist_ok=True)
+    variant = f":{variant_name}" if variant_name else ""
+    metrics_file = results_dir / f"metrics_{args.model}{variant}.csv"
+    scoring_file = results_dir / f"scoring_rule_{args.model}{variant}.csv"
+
+    if metrics_manager.scoring_rule:
+        metrics_df, scoring_df = metrics_manager.summary()
+        metrics_df.to_csv(metrics_file, index=False)
+        scoring_df.to_csv(scoring_file, index=False)
+        print(
+            f"[Results] metrics -> {metrics_file}\n[Results] scoring_rule -> {scoring_file}"
+        )
+    else:
+        metrics_df = metrics_manager.summary()
+        metrics_df.to_csv(metrics_file, index=False)
+        print(f"[Results] metrics -> {metrics_file}")
+
+    # === 使用 aggregate.return_aggregate 打印聚合结果（median / mean） ===
+    model_tag = f"{args.model}{variant}"
+    metric_names = [m.name for m in metrics_manager.metrics_list]
+    if metrics_manager.scoring_rule:
+        metric_names += [metrics_manager.scoring_rule.name]
+
+    print("\nAggregates (real)")
+    real_med = aggregate.return_aggregate(
+        model_list=[model_tag],
+        results_dir=str(results_dir),
+        experiment=args.experiment_tag,  # 默认 "zero_shot"，与既有工具兼容
+        metrics=metric_names,
+        aggregate="median",
+        exclude_simulated=True,
+    )
+    aggregate.pretty_print(real_med, aggregate="median")
+
+    real_mean = aggregate.return_aggregate(
+        model_list=[model_tag],
+        results_dir=str(results_dir),
+        experiment=args.experiment_tag,
+        metrics=metric_names,
+        aggregate="mean",
+        exclude_simulated=True,
+    )
+    aggregate.pretty_print(real_mean, aggregate="mean")
+
+
+# =========================
+#  Cofactor 子集映射
+# =========================
+cofactor_type: dict[str, list[str]] = {
+    "Kindergarten": [
+        "building6396",
+        "building6398",
+        "building6402",
+        "building6405",
+        "building6406",
+        "building6407",
+        "building6409",
+        "building6415",
+        "building6419",
+        "building6421",
+        "building6422",
+        "building6425",
+        "building6426",
+        "building6428",
+        "building6429",
+        "building6433",
+        "building6434",
+        "building6437",
+        "building6439",
+        "building6443",
+    ],
+    "School": [
+        "building6397",
+        "building6400",
+        "building6404",
+        "building6408",
+        "building6413",
+        "building6414",
+        "building6416",
+        "building6418",
+        "building6420",
+        "building6424",
+        "building6431",
+        "building6432",
+        "building6438",
+        "building6440",
+        "building6444",
+        "building6445",
+    ],
+    "NursingHome": [
+        "building6399",
+        "building6410",
+        "building6412",
+        "building6417",
+        "building6423",
+        "building6436",
+        "building6442",
+    ],
+    "Office": ["building6411", "building6441"],
+}
+
+
+# =========================
+#  主流程：训练 + 测试
+# =========================
+def main(args, model_args: Dict):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 固定随机性
+    utils.set_seed(args.random_seed)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # 加载数据
+    # loader 期望 "", "standard", "boxcox" 三种字符串，不传 None
+    scaler_flag = args.apply_scaler_transform
+
+    # 仅在 BUILDINGS_BENCH 存在时显式传路径；否则交给数据管线默认逻辑
+    _bb = os.environ.get("BUILDINGS_BENCH")
+    dataset_path = Path(_bb) if _bb else None
+    scaler_transform_path = (Path(_bb) / "metadata" / "transforms") if _bb else None
+
+    # 1) 获取“按楼栋生成器”的集合
+    if args.dataset.startswith("cofactor:"):
+        dataset_name = "cofactor"
+    else:
+        dataset_name = args.dataset
+    gen = load_torch_dataset(
+        dataset_name,
+        dataset_path=dataset_path,
+        context_len=args.ctx_len,
+        pred_len=args.pred_len,
+        apply_scaler_transform=scaler_flag,
+        scaler_transform_path=scaler_transform_path,
+    )
+    # 2) 收集成可下标数据集
+    ds_list = []
+    for bid, bldg_ds in gen:
+        # 如果 dataset 是 cofactor:Type，就过滤 building_id
+        if args.dataset.startswith("cofactor:"):
+            subtype = args.dataset.split(":", 1)[1]
+            allow = set(cofactor_type.get(subtype, []))
+            if bid not in allow:
+                continue
+        ds_list.append(bldg_ds)
+    if len(ds_list) == 0:
+        raise RuntimeError("空数据集：未从生成器中收集到任何楼栋子数据集")
+    full_ds = ConcatDataset(ds_list)
+
+    # 3) 现在可以索引与断言
+    sample0 = full_ds[0]
+    assert "load" in sample0, "样本缺少 'load' 键"
+    assert len(sample0["load"]) >= args.ctx_len + args.pred_len, "序列长度不足"
+
+    train_loader, val_loader, test_loader = build_dataloaders(
+        full_ds,
+        args.ctx_len,
+        args.pred_len,
+        args.batch_size,
+        args.random_seed,
+        args.num_workers,
+    )
+
+    # 构建模型
+    model, loss_fn, _ = model_factory(args.model, model_args)
+    model = model.to(device)
+
+    # 如提供预训练路径：优先加载（适用于 BuildMoE 等 BaseModel）
+    load_pretrained_if_any(model, args.pretrained_path, device)
+
+    # 通过模型方法得到可训练参数（冻结/解冻由模型内部控制）
+    params = model.unfreeze_and_get_parameters_for_finetuning()
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+
+    # 恒等 LR 调度器（保证可保存/可恢复）
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+
+    criterion = getattr(model, "loss", None) or loss_fn
+
+    # 训练
+    ckpt_dir = Path(args.ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt = ckpt_dir / f"{args.dataset}_{args.model}_{args.pred_len}_best.pt"
+    best_val, best_epoch, no_improve = float("inf"), -1, 0
+
+    print(
+        f"==> Train | dataset={args.dataset} model={args.model} ctx={args.ctx_len} "
+        f"pred={args.pred_len} bs={args.batch_size} lr={args.lr} wd={args.weight_decay} "
+        f"scaler={scaler_flag} seed={args.random_seed} pretrained={bool(args.pretrained_path)}"
+    )
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for batch in train_loader:
+            for k, v in list(batch.items()):
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+            ctx_len = int(batch.pop("context_len"))
+            pred_len = int(batch.pop("pred_len"))
+
+            preds = model(batch, context_len=ctx_len, pred_len=pred_len)
+            tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
+
+            loss = criterion(preds, tgt)
+            optimizer.zero_grad()
+            loss.backward()
+            # 兼容多 param group 的裁剪
+            for g in optimizer.param_groups:
+                torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        scheduler.step()  # 即便恒等，也确保 state_dict 演进一次
+
+        avg_loss = total_loss / max(1, len(train_loader))
+        val_rmse, val_mae = quick_eval_rmse_mae(model, val_loader, device)
+        print(
+            f"[Epoch {epoch:03d}] train_loss={avg_loss:.6f} val_RMSE={val_rmse:.6f} val_MAE={val_mae:.6f}"
+        )
+
+        if val_rmse < best_val - 1e-9:
+            best_val, best_epoch, no_improve = val_rmse, epoch, 0
+            save_model_checkpoint(
+                model, optimizer, scheduler, epoch, best_val, best_ckpt
+            )
+            print(f"  >> Saved best -> {best_ckpt} (val_RMSE={best_val:.6f})")
+        else:
+            no_improve += 1
+            if args.patience > 0 and no_improve >= args.patience:
+                print(
+                    f"==> Early stop at epoch {epoch}, best@{best_epoch}={best_val:.6f}"
+                )
+                break
+
+    # 测试：加载最佳（若失败会抛异常；可按需 try/except）
+    _step, _best = load_model_checkpoint(
+        best_ckpt,
+        model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        local_rank=0,
+        strict=False,
+    )
+
+    # 先打印简易 RMSE/MAE（缩放空间）
+    test_rmse, test_mae = quick_eval_rmse_mae(model, test_loader, device)
+    print(f"[Test@Best] RMSE={test_rmse:.6f} MAE={test_mae:.6f}")
+
+    # 正式出表 + 聚合
+    results_dir = Path(args.results_path)
+    test_with_metrics_manager_and_aggregate(
+        args=args,
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        results_dir=results_dir,
+        variant_name=args.variant_name,
+    )
+
+
+# =========================
+#  CLI
+# =========================
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    valid_datasets = ["university", "cofactor"] + [
+        f"cofactor:{k}" for k in cofactor_type.keys()
+    ]
+    p.add_argument("--dataset", required=True, choices=valid_datasets)
+    p.add_argument(
+        "--model", required=True, help="BuildMoE / DLinearRegression / NLinear 等"
+    )
+    p.add_argument("--ctx_len", type=int, default=168)
+    p.add_argument("--pred_len", type=int, default=24)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--patience", type=int, default=0, help="早停轮数；0 表示禁用")
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--ckpt_dir", type=Path, default=Path("checkpoints"))
+    p.add_argument("--results_path", type=Path, default=Path("results"))
+    p.add_argument("--variant_name", type=str, default="")
+    p.add_argument(
+        "--experiment_tag",
+        type=str,
+        default="zero_shot",
+        help="aggregate 用的 experiment 标签（与既有工具目录对齐）",
+    )
+    p.add_argument(
+        "--apply_scaler_transform",
+        choices=["", "standard", "boxcox"],
+        default="boxcox",
+        help="'' 表示不使用 scaler；Box-Cox 时会尝试反变换到实量纲评测",
+    )
+    p.add_argument("--random_seed", type=int, default=42)
+    p.add_argument(
+        "--pretrained_path",
+        type=str,
+        default="",
+        help="可选：预训练 checkpoint 路径（适用于 BuildMoE 等 BaseModel）",
+    )
+    p.add_argument(
+        "--ignore_scoring_rules",
+        action="store_true",
+        help="评测时不计算 CRPS/RPS（仅基础指标）",
+    )
+
+    args = p.parse_args()
+
+    # === 读取模型配置（包资源优先，回退到本地项目路径）===
+    try:
+        with ir.files("buildings_bench.configs").joinpath(f"{args.model}.toml").open(
+            "rb"
+        ) as f:
+            toml_cfg = tomli.load(f)
+    except FileNotFoundError:
+        cfg_dir = Path(__file__).parent / "buildings_bench" / "configs"
+        toml_file = cfg_dir / f"{args.model}.toml"
+        with toml_file.open("rb") as f:
+            toml_cfg = tomli.load(f)
+
+    model_args: Dict = toml_cfg["model"]
+
+    model_args["context_len"] = args.ctx_len
+    model_args["pred_len"] = args.pred_len
+
+    main(args, model_args)
