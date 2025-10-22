@@ -3,26 +3,32 @@
 """
 train_mixed.py  –  变长输入 / 输出混合训练 + 验证 RMSE/MAE
 ------------------------------------------------------------
-• 每个 mini‑batch 随机采样 (ctx_len, pred_len)
+• 每个 mini-batch 随机采样 (ctx_len, pred_len)
 • Loss 先对序列平均再对 batch 平均
 • Optimizer / Scheduler 按真实 token 数更新
 • 每 N 更新在验证集上计算 “平均 RMSE / MAE”
 """
 
 from __future__ import annotations
+
+import argparse
+import datetime
+import math
+import os
+import random
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-import argparse, datetime, math, os, random, tomli, numpy as np
-import time
 from pathlib import Path
 from typing import Dict
 
-import torch, torch.distributed
-import torch.utils.data.distributed
-import torch.amp
-import transformers
+import numpy as np
 import swanlab
-from statsmodels.tsa.seasonal import STL
+import tomli
+import torch
+import torch.amp
+import torch.distributed
+import torch.utils.data.distributed
+import transformers
 
 # ---------- 项目依赖 ----------
 from buildings_bench import utils
@@ -30,7 +36,7 @@ from buildings_bench.data.new import build_datasets, worker_init_fn
 from buildings_bench.models import model_factory
 from buildings_bench.tokenizer import LoadQuantizer
 from buildings_bench.transforms import BoxCoxTransform, StandardScalerTransform
-
+from statsmodels.tsa.seasonal import STL
 
 # 建议在训练脚本入口处限制底层 BLAS 线程，避免和批内并行抢核
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -119,8 +125,16 @@ def mixed_len_collate(
         "load": _stack("load", torch.float32),  # 注意：这里已是 Box-Cox 尺度
     }
     for k in batch[0]:
+        v0 = batch[0][k]
         if k not in collated:
-            collated[k] = _stack(k, torch.float32)
+            if isinstance(v0, (torch.Tensor, np.ndarray)):
+                collated[k] = _stack(k, torch.float32)
+            elif isinstance(v0, (int, float)):
+                collated[k] = torch.tensor([s[k] for s in batch], dtype=torch.float32)
+            # 如果是 str，就直接跳过，或者保存在一个 list 中
+            elif isinstance(v0, str):
+                # collated["meta"][k] = [s.get(k, "") for s in batch]
+                pass
     if STL_ENABLED:
 
         # ─────────────────────────────────────────────────────────────
@@ -200,8 +214,17 @@ def fixed_len_collate(
     }
     # 任何额外键（例如天气列）也一并堆起来
     for k in batch[0]:
-        if k not in merged and isinstance(batch[0][k], (torch.Tensor, np.ndarray)):
-            merged[k] = _stack(k, torch.float32)
+        v0 = batch[0][k]
+        if k not in merged:
+            if isinstance(v0, (torch.Tensor, np.ndarray)):
+                merged[k] = _stack(k, torch.float32)
+            elif isinstance(v0, (int, float)):
+                merged[k] = torch.tensor([s[k] for s in batch], dtype=torch.float32)
+            # 如果是 str，就直接跳过，或者保存在一个 list 中
+            elif isinstance(v0, str):
+                # merged["meta"][k] = [s.get(k, "") for s in batch]
+                pass
+
     if STL_ENABLED:
         # ── STL 分解：仅 context 段 ─────────────────────────────────────
         load = merged["load"]  # [B, seq_len, 1]
@@ -354,7 +377,7 @@ def main(args, model_args):
             tags=[args.model, "mixed_len"],
             config={**vars(args), "model_args": model_args},
             mode="disabled" if args.disable_wandb else "cloud",
-            resume="allow",
+            resume="allow" if not args.disable_wandb else "never",
             id=args.swanlab_id,
         )
 
@@ -469,7 +492,7 @@ def main(args, model_args):
     # 6. 训练循环
     # ════════════════════════════════════════════════
     # ════════════════════════════════════════════════
-    # 6‑0. 可选：从检查点恢复
+    # 6-0. 可选：从检查点恢复
     # ════════════════════════════════════════════════
     best_val_rmse = float("inf")
     tokens_buf = seen_tokens = update_idx = 0
@@ -519,7 +542,12 @@ def main(args, model_args):
         with torch.amp.autocast("cuda"):
             preds = model(batch, context_len=ctx_len, pred_len=pred_len)
             tgt = batch["load"][:, ctx_len:seq_len]
-            loss = loss_fn(preds, tgt)
+            try:
+                progress = min(1.0, float(seen_tokens) / max(1, args.train_tokens))
+                loss = model.module.loss(preds, tgt, progress=progress)
+            except Exception as e:
+                loss = loss_fn(preds, tgt)
+                continue
 
         scaler.scale(loss).backward()
 
@@ -593,7 +621,7 @@ def main(args, model_args):
 
         #     update_idx += 1
 
-        # rank‑0 训练日志
+        # rank-0 训练日志
         if args.rank == 0 and step % args.log_every == 0:
             swanlab.log(
                 {
@@ -610,16 +638,16 @@ def main(args, model_args):
                 f"loss={loss:.4f} H={pred_len} tok_seen={seen_tokens/1e6:.1f}M",
                 flush=True,
             )
-        if args.rank == 0 and step % 10000 == 0:
-            utils.save_model_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                update_idx,
-                best_val_rmse,
-                checkpoint_dir / f"{ckpt_name}_iter{step}.pt",
-            )
-            print(f"[rank 0] 已保存迭代 {step} 的检查点", flush=True)
+        # if args.rank == 0 and step % 10000 == 0:
+        #     utils.save_model_checkpoint(
+        #         model,
+        #         optimizer,
+        #         scheduler,
+        #         update_idx,
+        #         best_val_rmse,
+        #         checkpoint_dir / f"{ckpt_name}_iter{step}.pt",
+        #     )
+        #     print(f"[rank 0] 已保存迭代 {step} 的检查点", flush=True)
 
         if update_idx >= total_updates:
             break

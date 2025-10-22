@@ -10,7 +10,7 @@
 # conda activate bec
 
 # 1. 设置 BUILDINGS_BENCH 环境变量（指向你本地克隆的仓库根目录）
-export BUILDINGS_BENCH=/mnt/data/lx/buildings-bench/v2.0.0/BuildingsBench
+export BUILDINGS_BENCH=/home/hadoop/bec/buildings-bench/v2.0.0/BuildingsBench
 
 # 2. 指定 Python 可执行文件（可选，若 you want 用绝对路径）
 PYTHON=python
@@ -19,15 +19,16 @@ PYTHON=python
 export CUDA_VISIBLE_DEVICES=0
 
 # 4. 运行 zero-shot 脚本
-$PYTHON scripts/zero_shot.py \
-    --model TransformerWithGaussianAndMoEs-S \
-    --benchmark all \
-    --checkpoint checkpoints/TransformerWithGaussianAndMoEs-S_best.pt \
-    --apply_scaler_transform boxcox
-
 # $PYTHON scripts/zero_shot.py \
-#     --model chronos \
-#     --benchmark all
+#     --model TransformerWithGaussianAndMoEs-L \
+#     --benchmark real \
+#     --checkpoint checkpoints/TransformerWithGaussianAndMoEs-L_Update-15-huber_last.pt \
+#     --apply_scaler_transform boxcox
+
+$PYTHON scripts/zero_shot.py \
+    --model timemoe \
+    --benchmark test \ 
+    --batch_size 64 \
 
 # 5. 如果想顺便打印出“中位数 + 95% CI”，不用额外再写 BASH，因为脚本最后已内置了
 #    aggregate.return_aggregate_median(...) + pretty_print_aggregates()。

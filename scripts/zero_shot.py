@@ -1,23 +1,20 @@
-import time
-import numpy as np
-import torch
-from pathlib import Path
 import argparse
 import os
-import tomli
-
-from functools import partial
+import time
 from concurrent.futures import ThreadPoolExecutor
-from statsmodels.tsa.seasonal import STL
+from functools import partial
+from pathlib import Path
 
-from buildings_bench import load_torch_dataset, benchmark_registry
-from buildings_bench import utils
-from buildings_bench.tokenizer import LoadQuantizer
+import numpy as np
+import tomli
+import torch
+from buildings_bench import benchmark_registry, load_torch_dataset, utils
+from buildings_bench.evaluation import aggregate, scoring_rule_factory
 from buildings_bench.evaluation.managers import BuildingTypes, DatasetMetricsManager
-from buildings_bench.evaluation import aggregate
 from buildings_bench.models import model_factory
-from buildings_bench.evaluation import scoring_rule_factory
+from buildings_bench.tokenizer import LoadQuantizer
 from buildings_bench.transforms import BoxCoxTransform
+from statsmodels.tsa.seasonal import STL
 
 SCRIPT_PATH = Path(os.path.realpath(__file__)).parent
 
@@ -399,6 +396,8 @@ def zero_shot_learning(args, model_args, results_path: Path):
         args.benchmark = y
     elif args.benchmark[0] == "bdg-2":
         args.benchmark = [x for x in benchmark_registry if "bdg-2:" in x]
+    elif args.benchmark[0] == "test":
+        args.benchmark = ["university", "cofactor"]
 
     if args.ignore_scoring_rules:
         metrics_manager = DatasetMetricsManager()
@@ -468,7 +467,9 @@ def zero_shot_learning(args, model_args, results_path: Path):
             ):  # Quantized loads
                 transform = load_transform.transform
                 inverse_transform = load_transform.undo_transform
-            elif args.apply_scaler_transform != "":  # Scaling continuous values
+            elif (
+                not is_fm and args.apply_scaler_transform != ""
+            ):  # Scaling continuous values
                 # transform = lambda x: x
 
                 # if isinstance(building_dataset, torch.utils.data.ConcatDataset):
@@ -489,6 +490,7 @@ def zero_shot_learning(args, model_args, results_path: Path):
                     # stl_boxcox.load(transform_path)
 
             else:  # Continuous unscaled values
+                scaler = None
                 transform = lambda x: x
                 inverse_transform = lambda x: x
 
