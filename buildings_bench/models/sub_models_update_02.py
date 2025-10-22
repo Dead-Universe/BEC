@@ -1,16 +1,14 @@
-from typing import Dict, List, Literal, Optional, Tuple, Union
-import numpy as np
-from pydantic import BaseModel as PyBaseModel, ConfigDict
-from buildings_bench.models.base_model import BaseModel
-import torch
-from torch import nn
-import torch.nn.functional as F
-import torch.distributed
-
 import math
+from typing import List, Literal, Optional, Tuple, Union
 
-from buildings_bench.models.model_kernel import apply_init
+import numpy as np
+import torch
+import torch.distributed
+import torch.nn.functional as F
 from buildings_bench.models.rope import RoPEMultiheadAttention
+from pydantic import BaseModel as PyBaseModel
+from pydantic import ConfigDict
+from torch import nn
 
 
 def _global_mean_nograd(t: torch.Tensor) -> torch.Tensor:
@@ -263,14 +261,9 @@ class RMSNorm(nn.Module):
 
 
 class Gate(nn.Module):
-    """
-    MoE 路由 Gate
-
-    Args:
-        args (ModelArgs): 全局超参数配置
-    """
-
-    def __init__(self, args: ModelArgs):
+    def __init__(
+        self, args: ModelArgs, temperature: float = 1.0, noisy_std: float = 0.0
+    ):
         super().__init__()
         self.args = args
         self.dim = args.dim
@@ -280,68 +273,97 @@ class Gate(nn.Module):
         self.score_func = args.score_func
         self.route_scale = args.route_scale
 
-        # 用于生成路由得分的线性权重和可选 bias
-        self.bias = (
-            nn.Parameter(torch.zeros(args.n_routed_experts))
-            if self.dim == 7168
-            else None
-        )
+        self.bias = nn.Parameter(torch.zeros(args.n_routed_experts))
 
-        # 内部的投影层
-        self.router = nn.Linear(
-            in_features=args.dim,
-            out_features=args.n_routed_experts,
-            bias=False,
-        )
+        self.router = nn.Linear(args.dim, args.n_routed_experts, bias=False)
 
-        # 初始化 Gate 自身的 weight
+        self.temperature = temperature
+        self.noisy_std = noisy_std
+
         self.reset_parameters()
 
     def reset_parameters(self):
-        """初始化 Gate 权重"""
-        # apply_init(self.router, self.args.init_method, self.args.init_gain)
-        # bias 已在构造时置零
+        nn.init.zeros_(self.router.weight)  # 关键：全 0
+        nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        返回 routing weights 和 experts indices
-        """
-        scores = self.router(x)
-        # 加 bias
-        if self.bias is not None:
-            scores = scores + self.bias
+        T = x.size(0)
+        E = self.args.n_routed_experts
+        k = self.topk
+        G = self.n_groups
+        g = self.topk_groups
 
-        self.last_logits = scores
-        # 评分函数
+        # 1) logits (+noise) & cache
+        logits = self.router(x) + self.bias  # [T,E]
+        if self.noisy_std > 0 and self.training:
+            logits = logits + self.noisy_std * torch.randn_like(logits)
+        self.last_logits = logits  # for debug/other uses
+
+        # 2) scores before grouping (作为“原始概率”)
         if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
-        else:
-            scores = scores.sigmoid()
-        original_scores = scores.clone()
+            scores = F.softmax(logits / max(self.temperature, 1e-6), dim=-1)  # [T,E]
+        else:  # "sigmoid"
+            scores = torch.sigmoid(logits)  # [T,E]
+        original_scores = scores
 
-        # 多组路由逻辑
-        if self.n_groups > 1:
-            scores = scores.reshape(x.size(0), self.n_groups, -1)
+        # 3) grouping / limited groups → 仅用于选 idx 的“可选集合”
+        #    我们构造一个 allow mask (float, 0/1)，后面也会用于 lb_p_mean
+        if G > 1:
+            assert E % G == 0, "E must be divisible by number of groups"
+            group_size = E // G
+            scores_g = scores.view(T, G, group_size)  # [T,G,E/G]
             if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+                group_rep = scores_g.amax(dim=-1)  # [T,G]
             else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(
-                1, indices, False
-            )
-            scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf")).flatten(1)
+                top2 = scores_g.topk(2, dim=-1).values.sum(dim=-1)  # [T,G]
+                group_rep = top2
+            grp_idx = group_rep.topk(g, dim=-1).indices  # [T,g]
 
-        # 最终 top-k 选专家
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices).clone()
+            # bool mask: True 表示被屏蔽（不可选）
+            mask = torch.ones(T, G, dtype=torch.bool, device=scores.device)
+            mask.scatter_(1, grp_idx, False)
+            # 生成 allow mask 到专家粒度 [T,E]，True=允许
+            allow = (~mask).unsqueeze(-1).expand(T, G, group_size).reshape(T, E)
+            # 为了 topk 方便，把不允许位置设为 -inf（在 scores 上）
+            scores_g = scores_g.masked_fill(mask.unsqueeze(-1), float("-inf"))
+            scores_for_topk = scores_g.flatten(1)  # [T,E]
+        else:
+            allow = torch.ones(T, E, dtype=torch.bool, device=scores.device)
+            scores_for_topk = scores  # [T,E]
 
-        # sigmoid 下归一化
-        if self.score_func == "sigmoid":
-            weights = weights / weights.sum(dim=-1, keepdim=True)
+        # 4) 选 k 个专家（用于真正路由）
+        idx = scores_for_topk.topk(k, dim=-1).indices  # [T,k]
+        w = original_scores.gather(1, idx).clone()  # [T,k] 来自“原始概率”
+        w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-9)  # 归一化
+        if self.route_scale != 1.0:
+            w = w * self.route_scale
 
-        weights = weights * self.route_scale
-        return weights.type_as(x), indices
+        # ====== 下面是新增：给 loss 的轻量缓存 ======
+        with torch.no_grad():
+            # 使用 one-hot 统计使用频率：对 token 与 k 两个维度平均 → [E]
+            counts = torch.bincount(idx.view(-1), minlength=E).float()  # [E]
+            usage_frac = counts / (T * k)
+            self.lb_usage_frac = usage_frac  # no grad
+
+            # 构造与“可选集合”一致的有效概率分布 p_eff，并做专家维度归一化
+            allow_f = allow.float()
+            p_eff = original_scores * allow_f  # [T,E]
+            p_eff = p_eff / p_eff.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            # 平均到专家维度 → [E] （保留梯度的版本在下方计算）
+            # 注意：为了 stop-grad 技巧，我们既需要 no-grad，也需要带梯度的版本
+        # 带梯度的 p_eff_mean（用 original_scores 保留梯度；allow_f 不需要梯度）
+        p_eff_with_grad = original_scores * allow.float()
+        p_eff_with_grad = p_eff_with_grad / p_eff_with_grad.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-9)
+        self.lb_p_mean = p_eff_with_grad.mean(dim=0)  # [E], with grad
+
+        # 额外记录 token / expert / k
+        self.lb_T = int(T)
+        self.lb_E = int(E)
+        self.lb_k = int(k)
+
+        return w.type_as(x), idx
 
 
 class MLP(nn.Module):
@@ -464,7 +486,8 @@ class Encoder(nn.Module):
         )
         if args.use_dense:
             self.ffn = MLP(
-                args.dim, (args.n_activated_experts + 1) * args.moe_inter_dim
+                args.dim,
+                (args.n_activated_experts + args.n_shared_experts) * args.moe_inter_dim,
             )
 
         self.attn_norm = RMSNorm(args.dim)
@@ -526,7 +549,8 @@ class Decoder(nn.Module):
         )
         if args.use_dense:
             self.ffn = MLP(
-                args.dim, (args.n_activated_experts + 1) * args.moe_inter_dim
+                args.dim,
+                (args.n_activated_experts + args.n_shared_experts) * args.moe_inter_dim,
             )
         self.norm2 = RMSNorm(args.dim)
         if args.arch_mode == "encdec":
@@ -596,9 +620,6 @@ class Decoder(nn.Module):
         return self.ans_norm(out)  # [B, S_tgt, D] 输出
 
 
-# ──────────────────────────────────────────────
-# 1.  通用位置编码
-# ──────────────────────────────────────────────
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len):
         super().__init__()
@@ -618,9 +639,6 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[start_pos : start_pos + x.size(1)]
 
 
-# ──────────────────────────────────────────────
-# 2.  单字段 → 向量 的小工具
-# ──────────────────────────────────────────────
 def make_linear(in_dim, out_dim):  # 简写
     return nn.Sequential(nn.Linear(in_dim, out_dim), nn.GELU())
 

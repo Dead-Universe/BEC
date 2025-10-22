@@ -1756,9 +1756,9 @@ class TimeMoeForecasting(nn.Module):
         context_len: int = 168,
         pred_len: int = 24,
         # TimeMoe 主干的超参映射
-        d_model: int = 256,
-        nhead: int = 8,
-        dim_feedforward: int = 1024,
+        d_model: int = 768,
+        nhead: int = 12,
+        dim_feedforward: int = 3072,
         num_layers: int = 12,
         num_experts: int = 8,
         top_k: int = 2,
@@ -1793,9 +1793,10 @@ class TimeMoeForecasting(nn.Module):
             num_experts=num_experts,
             num_experts_per_tok=top_k,
             attention_dropout=dropout,
-            use_cache=False,
+            use_cache=True,
             use_dense=False,  # 使用稀疏 MoE
             apply_aux_loss=True,  # 需要让路由logits在模型中向外传递
+            max_position_embeddings=4096,
         )
         # 设置注意力实现
         try:
@@ -2089,24 +2090,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = (
-        TimeMoeForecasting(
-            max_context_len=336,
-            max_pred_len=168,
-            context_len=168,
-            pred_len=24,
-            d_model=768,
-            nhead=12,
-            dim_feedforward=2048,
-            num_layers=10,
-            num_experts=8,
-            top_k=2,
-            continuous_head="huber",  # 可改为 "mse" / "gaussian_nll"
-            aux_lambda=0.01,
-        )
-        .to(device)
-        .train()
-    )
+    model = TimeMoeForecasting().to(device).train()
 
     # model参数量
     total_params = sum(p.numel() for p in model.parameters())

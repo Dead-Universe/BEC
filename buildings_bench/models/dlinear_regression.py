@@ -1,8 +1,9 @@
+from typing import Dict, Optional
+
 import torch
-from buildings_bench.models.base_model import BaseModel
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from buildings_bench.models.base_model import BaseModel
 
 
 class moving_avg(nn.Module):
@@ -57,7 +58,12 @@ class DLinearRegression(BaseModel):
         # self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
         # self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ):
         # x: [Batch, Input length, Channel]
         src_series = x["load"][:, : self.context_len, :]
         seasonal_init, trend_init = self.decompsition(src_series)
@@ -72,10 +78,17 @@ class DLinearRegression(BaseModel):
         return x.permute(0, 2, 1)  # to [Batch, Output length, Channel]
 
     def loss(self, x, y):
-        return torch.nn.functional.mse_loss(x, y)
+        err = F.huber_loss(x, y, delta=1.0, reduction="none")
+        loss = err.mean()
+        return loss
 
-    def predict(self, x):
-        return self.forward(x), None
+    def predict(
+        self,
+        x,
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ):
+        return self.forward(x, context_len, pred_len), None
 
     def unfreeze_and_get_parameters_for_finetuning(self):
         for p in self.parameters():
@@ -255,6 +268,28 @@ class DLinearUnified(BaseModel):
         self.load_state_dict(state, strict=False)
 
 
+class DLinearExpert(nn.Module):
+    """
+    DLinear Expert for MoE
+    输入输出都保持 (B, L, d)，和 MLP Expert 一致。
+    """
+
+    def __init__(self, d_model: int, kernel_size: int = 25):
+        super().__init__()
+        self.decomposition = SeriesDecomp(kernel_size)
+
+        # 特征维度线性映射 (不涉及时间维缩放)
+        self.Linear_Seasonal = nn.Linear(d_model, d_model)
+        self.Linear_Trend = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, d)
+        seasonal_init, trend_init = self.decomposition(x)  # 分解趋势 & 季节性
+        seasonal_out = self.Linear_Seasonal(seasonal_init)  # (B, L, d)
+        trend_out = self.Linear_Trend(trend_init)  # (B, L, d)
+        return seasonal_out + trend_out
+
+
 if __name__ == "__main__":
     model = DLinearUnified()
     x = torch.randn(16, 300 + 100, 1)
@@ -262,3 +297,7 @@ if __name__ == "__main__":
     print(y.shape)
     loss = model.loss(y, torch.randn(16, 100, 1))
     print(loss)
+    model = DLinearExpert(d_model=8)
+    x = torch.randn(16, 100, 8)
+    y = model(x)
+    print(y.shape)

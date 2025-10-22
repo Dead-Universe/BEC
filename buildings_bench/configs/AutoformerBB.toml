@@ -1,0 +1,19 @@
+[model]
+max_context_len = 336
+max_pred_len = 168
+context_len = 168
+pred_len   = 24
+d_model    = 128
+n_heads    = 4
+d_ff       = 512
+e_layers   = 2
+d_layers   = 1
+moving_avg = 25
+factor     = 3
+dropout    = 0.05
+activation = "gelu"
+embed = "timeF"
+freq  = "h"
+label_len = 48
+continuous_loads = true
+continuous_head = "huber"

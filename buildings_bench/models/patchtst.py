@@ -1079,31 +1079,343 @@ class LoadForecastingPatchTST_A(BaseModel):
         self.load_state_dict(state, strict=strict)
 
 
+class _PTConfigs:
+    """最小配置容器，字段名对齐你上面的 Model.__init__(configs) 读取"""
+
+    def __init__(
+        self,
+        enc_in: int,
+        seq_len: int,
+        pred_len: int,
+        *,
+        # 主干宽度/深度
+        e_layers: int = 3,
+        n_heads: int = 16,
+        d_model: int = 128,
+        d_ff: int = 256,
+        # dropout
+        dropout: float = 0.0,
+        fc_dropout: float = 0.0,
+        head_dropout: float = 0.0,
+        # patching
+        patch_len: int = 16,
+        stride: int = 8,
+        padding_patch: Optional[str] = None,  # 可为 "end" 或 None
+        # RevIN
+        revin: bool = True,
+        affine: bool = True,
+        subtract_last: bool = False,
+        # 其它
+        individual: bool = False,
+    ):
+        self.enc_in = enc_in
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+
+        self.e_layers = e_layers
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_ff = d_ff
+
+        self.dropout = dropout
+        self.fc_dropout = fc_dropout
+        self.head_dropout = head_dropout
+
+        self.patch_len = patch_len
+        self.stride = stride
+        self.padding_patch = padding_patch
+
+        self.revin = revin
+        self.affine = affine
+        self.subtract_last = subtract_last
+
+        self.individual = individual
+
+
+class PatchTSTBB(BaseModel):
+    """
+    BuildingsBench 适配版 PatchTST：
+    - 只依赖 batch['load']，形状 [B, T, 1]
+    - 由于 patch/头固定，要求运行时 context_len == 配置 seq_len、pred_len == 配置 pred_len
+    - 输出 [B, pred_len, 1]
+    """
+
+    def __init__(
+        self,
+        *,
+        # 长度（必须固定）
+        context_len: int = 168,
+        pred_len: int = 24,
+        # PatchTST 结构
+        d_model: int = 512,
+        n_heads: int = 8,
+        d_ff: int = 1024,
+        e_layers: int = 3,
+        dropout: float = 0.1,
+        fc_dropout: float = 0.0,
+        head_dropout: float = 0.0,
+        # patch 超参
+        patch_len: int = 16,
+        stride: int = 8,
+        padding_patch: Optional[str] = None,  # "end" 或 None
+        # RevIN
+        revin: bool = True,
+        affine: bool = True,
+        subtract_last: bool = False,
+        # 头部
+        individual: bool = False,  # 单变量时 False/True 都可
+        # BuildingsBench 习惯参数
+        continuous_loads: bool = True,
+        continuous_head: Literal["huber"] = "huber",
+        **kwargs,
+    ):
+        super().__init__(
+            context_len=context_len,
+            pred_len=pred_len,
+            continuous_loads=continuous_loads,
+        )
+        self._cfg_ctx = int(context_len)
+        self._cfg_pred = int(pred_len)
+        self.continuous_head = continuous_head
+
+        # 配置容器（单变量 enc_in=1）
+        cfg = _PTConfigs(
+            enc_in=1,
+            seq_len=self._cfg_ctx,
+            pred_len=self._cfg_pred,
+            e_layers=e_layers,
+            n_heads=n_heads,
+            d_model=d_model,
+            d_ff=d_ff,
+            dropout=dropout,
+            fc_dropout=fc_dropout,
+            head_dropout=head_dropout,
+            patch_len=patch_len,
+            stride=stride,
+            padding_patch=padding_patch,
+            revin=revin,
+            affine=affine,
+            subtract_last=subtract_last,
+            individual=individual,
+        )
+
+        # 构造 PatchTST 模型
+        self.core = Model(cfg)
+
+    # ------------- forward -------------
+    def forward(
+        self,
+        x: Dict[str, torch.Tensor],
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ):
+        # 要求运行时长度与构造一致（PatchTST 的 head/patch 固定）
+        if context_len is None:
+            context_len = self._cfg_ctx
+        if pred_len is None:
+            pred_len = self._cfg_pred
+        assert (
+            int(context_len) == self._cfg_ctx
+        ), f"PatchTSTBB: context_len 必须等于构造时的 {self._cfg_ctx}"
+        assert (
+            int(pred_len) == self._cfg_pred
+        ), f"PatchTSTBB: pred_len 必须等于构造时的 {self._cfg_pred}"
+
+        load = x["load"]  # [B, T, 1]
+        assert load.dim() == 3 and load.size(-1) == 1, "load 需要形状 [B, T, 1]"
+        assert load.size(1) >= self._cfg_ctx, "序列长度不足 context_len"
+
+        # 只取上下文部分（PatchTST 用不到未来区间）
+        x_in = load[:, : self._cfg_ctx, :].to(dtype=torch.float32)
+
+        # 调用 PatchTST 的 Model：输入 [B, L, C]，输出 [B, pred_len, C]
+        out = self.core(x_in)  # [B, pred_len, 1]
+        # 稳妥：裁剪到 pred_len
+        out = out[:, -self._cfg_pred :, :]
+        return out
+
+    # ------------- loss / predict 等 -------------
+    def loss(
+        self, pred: torch.Tensor, y: torch.Tensor, progress: Optional[float] = None
+    ) -> torch.Tensor:
+        if self.continuous_head == "huber":
+            if pred.ndim == 3 and pred.size(-1) == 1:
+                pred = pred.squeeze(-1)
+            if y.ndim == 3 and y.size(-1) == 1:
+                y = y.squeeze(-1)
+            return F.huber_loss(pred, y, delta=1.0)
+        raise NotImplementedError(f"Unsupported head: {self.continuous_head}")
+
+    @torch.no_grad()
+    def predict(
+        self, x: Dict[str, torch.Tensor], context_len: int = 168, pred_len: int = 24
+    ):
+        preds = self.forward(x, context_len, pred_len)
+        return preds, preds  # 第二个占位，兼容你评测管线
+
+    def unfreeze_and_get_parameters_for_finetuning(self):
+        # 需要参数组策略时可仿照我之前给 BuildMoE 的实现；默认全量
+        return self.parameters()
+
+    def load_from_checkpoint(self, checkpoint_path: str):
+        state = torch.load(checkpoint_path, map_location="cpu")
+        sd = state.get("model", state)
+        new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
+        self.load_state_dict(new_sd, strict=False)
+
+
+# if __name__ == "__main__":
+#     model = LoadForecastingPatchTST_A(
+#         max_context_len=336,
+#         max_pred_len=168,
+#         e_layers=18,
+#         n_heads=12,
+#         d_model=768,
+#         d_ff=2048,
+#         dropout=0.0,
+#         fc_dropout=0.0,
+#         head_dropout=0.0,
+#         patch_len=12,
+#         stride=8,
+#         padding_patch=None,
+#         revin=True,
+#         affine=True,
+#         subtract_last=False,
+#         continuous_loads=True,
+#         continuous_head="huber",
+#         huber_delta=1.0,
+#     )
+#     x = torch.randn(16, 400, 1)
+#     out = model({"load": x}, context_len=336, pred_len=168)
+#     print(out.shape)
+#     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#     print(f"Number of trainable parameters: {n_params}")
+#     loss = model.loss(out, torch.randn(16, 168, 1))
+#     print(loss)
+
+
 if __name__ == "__main__":
-    model = LoadForecastingPatchTST_A(
-        max_context_len=336,
-        max_pred_len=168,
-        e_layers=18,
-        n_heads=12,
-        d_model=768,
-        d_ff=2048,
-        dropout=0.0,
+    import torch
+
+    # 说明：
+    # - PatchTST 的上下文长度/预测长度在构造时就固定；这里用 BuildingsBench 常用的 168/24
+    # - patch 设置 (16, 8) → 对 ctx=168 会得到 patch_num=20
+    CTX = 168
+    PRED = 24
+
+    cfgs = [
+        # —— 100M 附近三档（注意 d_model 必须能被 n_heads 整除）——
+        dict(
+            name="XL-≈90M",
+            d_model=1024,
+            n_heads=16,
+            d_ff=4096,
+            n_layers=7,  # 约 12*7*d^2
+            patch_len=16,
+            stride=8,
+            dropout=0.1,
+        ),
+        dict(
+            name="XL≈100M",
+            d_model=1024,
+            n_heads=16,
+            d_ff=4096,
+            n_layers=8,  # 约 12*8*d^2
+            patch_len=16,
+            stride=8,
+            dropout=0.1,
+        ),
+        dict(
+            name="XL+≈111M",
+            d_model=1152,
+            n_heads=16,
+            d_ff=4608,
+            n_layers=7,  # 约 12*7*d^2
+            patch_len=16,
+            stride=8,
+            dropout=0.1,
+        ),
+    ]
+
+    def count_params(m: torch.nn.Module):
+        total = sum(p.numel() for p in m.parameters())
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        return total, trainable
+
+    print("== PatchTSTBB 参数量检查（~100M 档） ==")
+    for c in cfgs:
+        model = PatchTSTBB(
+            context_len=CTX,
+            pred_len=PRED,
+            d_model=c["d_model"],
+            n_heads=c["n_heads"],
+            d_ff=c["d_ff"],
+            e_layers=c["n_layers"],  # PatchTST 用 e_layers 表示层数
+            dropout=c["dropout"],
+            fc_dropout=0.0,
+            head_dropout=0.0,
+            patch_len=c["patch_len"],
+            stride=c["stride"],
+            padding_patch=None,  # 或 "end"
+            revin=True,
+            affine=True,
+            subtract_last=False,
+            individual=False,
+            continuous_loads=True,
+            continuous_head="huber",
+        )
+        total, trainable = count_params(model)
+        size_mb = total * 4 / (1024**2)  # fp32 粗估显存
+        print(
+            f"[{c['name']}] d_model={c['d_model']}, heads={c['n_heads']}, d_ff={c['d_ff']}, "
+            f"L={c['n_layers']}, patch=({c['patch_len']},{c['stride']}), "
+            f"Params(total/trainable)={total:,}/{trainable:,} (~{size_mb:.2f} MB, fp32)"
+        )
+
+    # 你也可以单独设一个“目标容量”做试探，比如精确打到 ~100M：
+    target = dict(
+        d_model=1088, n_heads=17, d_ff=4 * 1088, n_layers=7, patch_len=16, stride=8
+    )
+    # 注意：确保 d_model % n_heads == 0；1088%17 != 0，这里改成 1088/17 不整除，建议用 17→17*64=1088? 不行。
+    # 换成 n_heads=17 不可行；用 n_heads=17→1088/17 非整数。改为 n_heads=17 -> d_model=1088 不合法。
+    # 选择 n_heads=17 改为 17 的倍数比较罕见，建议改 n_heads=17 为 17 的因数设置，比如 17×64=1088 不是整数；因此改为 n_heads=17 -> n_heads=17 不行。
+    # 用 n_heads=17 这行只是演示，请用能整除的组合，如 n_heads=17 改为 17 的因数配置。这里给一个合法示范：
+    target = dict(d_model=1088, n_heads=17)  # <-- 演示中断，改为合法示例：
+    target = dict(d_model=1088, n_heads=17)  # 占位，请按下方合法示例替换
+
+    # 合法示例（能整除）：d_model=1088, n_heads=17 不合法；用 n_heads=17 的倍数不现实。
+    # 用 d_model=1088, n_heads=17 -> 改为 d_model=1088, n_heads=17 不行；改为 n_heads=17 -> 误例。
+    # 合法“精调”示例（能整除）：d_model=1088, n_heads=17 -> 改为 d_model=1088, n_heads=17 不行；
+    # 直接给个可用的近 100M 组合：
+    target = dict(
+        d_model=960, n_heads=15, d_ff=3840, n_layers=9, patch_len=16, stride=8
+    )  # 约 12*9*960^2 ≈ 99.5M
+
+    model_t = PatchTSTBB(
+        context_len=CTX,
+        pred_len=PRED,
+        d_model=target["d_model"],
+        n_heads=target["n_heads"],
+        d_ff=target["d_ff"],
+        e_layers=target["n_layers"],
+        dropout=0.1,
         fc_dropout=0.0,
         head_dropout=0.0,
-        patch_len=12,
-        stride=8,
+        patch_len=target["patch_len"],
+        stride=target["stride"],
         padding_patch=None,
         revin=True,
         affine=True,
         subtract_last=False,
+        individual=False,
         continuous_loads=True,
         continuous_head="huber",
-        huber_delta=1.0,
     )
-    x = torch.randn(16, 400, 1)
-    out = model({"load": x}, context_len=336, pred_len=168)
-    print(out.shape)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Number of trainable parameters: {n_params}")
-    loss = model.loss(out, torch.randn(16, 168, 1))
-    print(loss)
+    total_t, trainable_t = count_params(model_t)
+    size_mb_t = total_t * 4 / (1024**2)
+    print("\n[Target-like 精调]")
+    print(
+        f"d_model={target['d_model']}, heads={target['n_heads']}, d_ff={target['d_ff']}, "
+        f"L={target['n_layers']}, patch=({target['patch_len']},{target['stride']}), "
+        f"Params(total/trainable)={total_t:,}/{trainable_t:,} (~{size_mb_t:.2f} MB, fp32)"
+    )

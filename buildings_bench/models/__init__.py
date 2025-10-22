@@ -1,27 +1,32 @@
 # buildings_bench.models
+from typing import Callable, Dict, Tuple
+
 import torch
-from typing import Callable, Tuple, Dict
+from buildings_bench.models.autoformer import AutoformerUnified, AutoformerBB
+from buildings_bench.models.chronos import ChronosAsLoadForecastAdapter
+from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
 
 # Import models here
 from buildings_bench.models.dlinear_regression import DLinearRegression, DLinearUnified
 from buildings_bench.models.linear_regression import LinearRegression
-from buildings_bench.models.self_transformers import LoadForecastingTransformer
+from buildings_bench.models.moment import MomentAsLoadForecastAdapter
+from buildings_bench.models.nliner import NLinearUnified, NLinearRegression
+from buildings_bench.models.patchtst import LoadForecastingPatchTST_A, PatchTSTBB
 from buildings_bench.models.persistence import (
     AveragePersistence,
     CopyLastDayPersistence,
     CopyLastWeekPersistence,
 )
-from buildings_bench.models.deep_rnn import DeepAutoregressiveRNN
+from buildings_bench.models.self_transformers import LoadForecastingTransformer
+from buildings_bench.models.sub_models import TimeSeriesTransformer
+from buildings_bench.models.timemoe import TimeMoeForecasting
 from buildings_bench.models.transformer_moes_update_20 import (
     LoadForecastingTransformerMoE,
 )
-from buildings_bench.models.sub_models import TimeSeriesTransformer
-from buildings_bench.models.patchtst import LoadForecastingPatchTST_A
-from buildings_bench.models.timemoe import TimeMoeForecasting
-from buildings_bench.models.chronos import ChronosAsLoadForecastAdapter
-from buildings_bench.models.moment import MomentAsLoadForecastAdapter
-from buildings_bench.models.autoformer import AutoformerUnified
-from buildings_bench.models.nliner import NLinearUnified
+from buildings_bench.models.buildmoe import BuildMoE
+from buildings_bench.models.seasonal_naive import SeasonalNaive24, SeasonalNaive168
+from buildings_bench.models.nhits import NHITSBB
+from buildings_bench.models.time_mixer import TimeMixerBB
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
@@ -57,15 +62,35 @@ model_registry = {
     "Decoder-L": LoadForecastingTransformerMoE,
     "Encoder-L": LoadForecastingTransformerMoE,
     "Transformer-L": LoadForecastingTransformerMoE,
+    "BuildMoE": LoadForecastingTransformerMoE,
+    "BuildMoE-top-k-1": BuildMoE,
+    "BuildMoE-top-k-2": BuildMoE,
+    "BuildMoE-top-k-1-without-shared-export": BuildMoE,
+    "BuildMoE-top-k-2-not-use-loopback": BuildMoE,
+    "BuildMoE-top-k-2-without-shared-export": BuildMoE,
+    "BuildMoE-top-k-4-without-shared-export": BuildMoE,
+    "BuildMoE-top-k-2-decoder-not-use-loopback": BuildMoE,
+    "BuildMoE-top-k-4": BuildMoE,
+    "BuildMoE-top-k-2-decoder": BuildMoE,
+    "BuildMoE-dense": BuildMoE,
     "TimeSeriesTransformer-S": TimeSeriesTransformer,
     "PatchTST-S": LoadForecastingPatchTST_A,
     "PatchTST-L": LoadForecastingPatchTST_A,
+    "PatchTSTBB": PatchTSTBB,
     "TimeMoE-S": TimeMoeForecasting,
     "TimeMoE-L": TimeMoeForecasting,
+    "TimeMoE-200M": TimeMoeForecasting,
     "Chronos-L": ChronosAsLoadForecastAdapter,
+    "Chronos-Base": ChronosAsLoadForecastAdapter,
     "Moment-L": MomentAsLoadForecastAdapter,
     "Autoformer-L": AutoformerUnified,
+    "AutoformerBB": AutoformerBB,
     "NLinear": NLinearUnified,
+    "NLinearRegression": NLinearRegression,
+    "SeasonalNaive24": SeasonalNaive24,
+    "SeasonalNaive168": SeasonalNaive168,
+    "NHITSBB": NHITSBB,
+    "TimeMixerBB": TimeMixerBB,
 }
 
 

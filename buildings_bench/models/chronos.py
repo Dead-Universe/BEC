@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import copy
-import logging
-from dataclasses import dataclass
+from typing import List
+
+import torch
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-import torch
+
+import copy
+import logging
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
+
 import torch.nn as nn
 from transformers.models.t5.modeling_t5 import (
     ACT2FN,
@@ -578,15 +583,17 @@ class ChronosBoltModelForForecasting(T5PreTrainedModel):
         return decoder_outputs.last_hidden_state  # sequence_outputs, b x 1 x d_model
 
 
-import copy
-from typing import Dict, Literal, Optional, Tuple
-
+from typing import Dict, Optional, Tuple, Literal
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 
 # === 引用你已有的基类与 Chronos 主体 ===
 from buildings_bench.models.base_model import BaseModel
-from torch import nn
+
+
+import copy
 
 
 class ChronosAsLoadForecastAdapter(BaseModel):
@@ -786,11 +793,11 @@ if __name__ == "__main__":
         pred_len=24,  # 本轮实际使用
         continuous_head="huber",
         device=device,
-        dim_feedforward=2048,
-        d_model=512,
-        num_heads=8,
-        num_encoder_layers=6,
-        num_decoder_layers=6,
+        # dim_feedforward=2048,
+        # d_model=512,
+        # num_heads=8,
+        # num_encoder_layers=6,
+        # num_decoder_layers=6,
     ).train()
 
     count_parameters = sum(p.numel() for p in adapter.parameters() if p.requires_grad)

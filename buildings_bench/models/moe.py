@@ -134,20 +134,26 @@ class MoEActivationHook:
         注意：这里只依赖 matplotlib，不额外指定样式/颜色，保持默认。
         """
         import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
 
         mat = self.usage(normalize=normalize).numpy()
 
+        # 自定义 colormap
+        cmap = LinearSegmentedColormap.from_list("black_blue", ["#FFFFFF", "#093F7F"])
+
         fig, ax = plt.subplots(figsize=figsize)
-        im = ax.imshow(mat, aspect="auto")  # 默认 colormap
+        im = ax.imshow(mat, aspect="auto", cmap=cmap)
+
         ax.set_xlabel("Expert ID")
         ax.set_ylabel("Gate (depth)")
         ax.set_xticks(range(self.n_experts))
         ax.set_yticks(range(len(self.gates)))
-        # ytick 使用更友好的名字（截断过长的 module 名）
         short_names = [n if len(n) <= 40 else n[-40:] for n in self.gate_names]
         ax.set_yticklabels(short_names)
+
         cbar = fig.colorbar(im, ax=ax)
         cbar.set_label("Activation share" if normalize else "Activation count")
+
         ax.set_title("MoE Expert Activation")
         plt.tight_layout()
         return fig

@@ -1,17 +1,22 @@
 [model]
 context_len = 168
 pred_len = 24
-max_context_len = 168
-max_pred_len = 24
-e_layers = 8
-d_layers = 8
-n_heads = 12
-d_ff = 2048
+max_context_len = 336
+max_pred_len = 168
+num_encoder_layers = 8
+num_decoder_layers = 10
+nhead = 12
+dim_feedforward = 2048
 d_model = 768
 dropout = 0.0
 activation = 'gelu'
 continuous_loads = true
+ignore_spatial = false
 continuous_head = 'huber'
+num_experts = 8
+top_k = 2
+n_shared_experts = 0
+use_dense = true
 
 [pretrain]
 batch_size = 32

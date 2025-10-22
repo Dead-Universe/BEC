@@ -138,6 +138,87 @@ class NLinearUnified(BaseModel):
         self.load_state_dict(state, strict=False)
 
 
+class NLinearRegression(BaseModel):
+    """
+    NLinear-Regression (简洁版)
+    - 直接对时间维做线性映射，不做分解
+    - 输入: (B, context_len, 1)
+    - 输出: (B, pred_len, 1)
+    """
+
+    def __init__(
+        self,
+        context_len: int = 168,
+        pred_len: int = 24,
+        continuous_loads: bool = True,
+        use_bias: bool = True,
+        huber_delta: float = 1.0,
+    ):
+        super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
+
+        self.huber_delta = huber_delta
+        self.Linear = nn.Linear(self.context_len, self.pred_len, bias=use_bias)
+
+        # trick: 去中心化再复原
+        self.use_demean = True
+
+    def forward(
+        self,
+        x: Dict[str, torch.Tensor],
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if context_len is None:
+            context_len = self.context_len
+        if pred_len is None:
+            pred_len = self.pred_len
+
+        load = x["load"][:, :context_len, :]  # (B, context_len, 1)
+        assert load.dim() == 3 and load.size(-1) == 1
+
+        if self.use_demean:
+            mean = load.mean(dim=1, keepdim=True)  # (B,1,1)
+            load_demean = load - mean
+        else:
+            mean = None
+            load_demean = load
+
+        # (B, L, 1) -> (B, 1, L)
+        src = load_demean.permute(0, 2, 1)
+        out = self.Linear(src)  # (B,1,pred_len)
+        out = out.permute(0, 2, 1)  # (B,pred_len,1)
+
+        if self.use_demean:
+            out = out + mean
+
+        return out
+
+    def loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return F.huber_loss(pred, y, delta=self.huber_delta, reduction="mean")
+
+    @torch.no_grad()
+    def predict(
+        self,
+        x: Dict[str, torch.Tensor],
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ):
+        preds = self.forward(x, context_len=context_len, pred_len=pred_len)
+        return preds, None  # 没有 distribution_params
+
+    def unfreeze_and_get_parameters_for_finetuning(self):
+        for p in self.parameters():
+            p.requires_grad = True
+        return self.parameters()
+
+    def load_from_checkpoint(self, checkpoint_path: str):
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state, dict) and "model" in state:
+            state = state["model"]
+        state = {k.replace("module.", ""): v for k, v in state.items()}
+        self.load_state_dict(state, strict=False)
+
+
 if __name__ == "__main__":
     model = NLinearUnified()
     x = torch.randn(2, 400, 1)

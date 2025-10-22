@@ -32,6 +32,7 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
         is_leap_year=False,
         weather_dataframe: pd.DataFrame | None = None,
         weather_transform_path: Path | None = None,
+        building_name: str | None = None,
     ):
         """
         Args:
@@ -47,6 +48,7 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
             weather_dataframe (pd.DataFrame, optional): Weather timeseries data. Defaults to None.
             weather_transform_path (Path, optional): Path to the pickled data for weather transform. Defaults to None.
         """
+        self.building_name = building_name
         self.df = dataframe
         self.building_type = building_type
         self.context_len = context_len
@@ -105,6 +107,7 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
             "building_type": building_features,
             "load": load_features[..., None],
         }
+        sample["building_id"] = self.building_name
 
         if self.weather_df is None:
             return sample
@@ -253,6 +256,7 @@ class TorchBuildingDatasetFromParquet:
                     is_leap_year,
                     weather_dataframe=weather_df,
                     weather_transform_path=weather_transform_path,
+                    building_name=building_name,
                 )
 
     def __len__(self):
@@ -395,6 +399,7 @@ class TorchBuildingDatasetsFromCSV:
                             is_leap_year,
                             weather_dataframe=weather_df,
                             weather_transform_path=weather_transform_path,
+                            building_name=bldg_name,
                         ),
                     )
                 ]

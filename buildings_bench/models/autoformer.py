@@ -1,6 +1,6 @@
 import math
 from types import SimpleNamespace
-from typing import Dict, Optional
+from typing import Dict, Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -763,9 +763,6 @@ class AutoformerUnified(BaseModel):
         output_attention: bool = False,
         **kwargs,
     ):
-        assert (
-            context_len == 336 and pred_len == 168
-        ), "方案A建议固定 context_len=336, pred_len=168 训练（评测时再截取）"
         super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
 
         self.label_len = label_len
@@ -927,12 +924,361 @@ class AutoformerUnified(BaseModel):
         self.load_state_dict(state, strict=False)
 
 
+class _AFConfigs:
+    """最小配置容器；和 AutoformerCore __init__ 里的读取保持字段名一致"""
+
+    def __init__(
+        self,
+        seq_len: int,
+        label_len: int,
+        pred_len: int,
+        enc_in: int = 1,
+        dec_in: int = 1,
+        c_out: int = 1,
+        d_model: int = 512,
+        n_heads: int = 8,
+        d_ff: int = 2048,
+        e_layers: int = 2,
+        d_layers: int = 1,
+        moving_avg: int = 25,
+        factor: int = 3,
+        dropout: float = 0.1,
+        embed: str = "timeF",  # 未用到位置编码时也可保留
+        freq: str = "h",
+        activation: str = "gelu",
+        output_attention: bool = False,
+    ):
+        self.seq_len = seq_len
+        self.label_len = label_len
+        self.pred_len = pred_len
+        self.enc_in = enc_in
+        self.dec_in = dec_in
+        self.c_out = c_out
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.e_layers = e_layers
+        self.d_layers = d_layers
+        self.moving_avg = moving_avg
+        self.factor = factor
+        self.dropout = dropout
+        self.embed = embed
+        self.freq = freq
+        self.activation = activation
+        self.output_attention = output_attention
+
+
+class AutoformerBB(BaseModel):
+    """
+    BuildingsBench 适配版 Autoformer：
+    - 输入 batch 至少包含 {"load": [B, T, 1]}，可选 {"x_mark_enc": [B, ctx, Dm], "x_mark_dec": [B, label_len+pred, Dm]}
+    - forward(context_len, pred_len) 固定 I/O；内部对 AutoformerCore 的长度动态对齐
+    - 输出 [B, pred_len, 1]
+    """
+
+    def __init__(
+        self,
+        max_context_len: int = 336,
+        max_pred_len: int = 168,
+        context_len: int = 168,
+        pred_len: int = 24,
+        *,
+        # Autoformer 结构参数
+        d_model: int = 512,
+        n_heads: int = 8,
+        d_ff: int = 2048,
+        e_layers: int = 2,
+        d_layers: int = 1,
+        moving_avg: int = 25,
+        factor: int = 3,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        embed: str = "timeF",  # 采用 TimeFeatureEmbedding（float）
+        freq: str = "h",  # 与 TimeFeatureEmbedding 的 freq_map 对齐（'h' -> 4 维）
+        output_attention: bool = False,
+        # BuildingsBench 习惯参数
+        continuous_loads: bool = True,
+        continuous_head: Literal["huber"] = "huber",
+        label_len: int = 48,  # decoder 侧“已知历史”长度上限
+        **kwargs,
+    ):
+        super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
+        self.max_context_len = int(max_context_len)
+        self.max_pred_len = int(max_pred_len)
+        self.continuous_head = continuous_head
+        self.label_len_cfg = int(label_len)  # 配置上限，实际会截断到 <= context_len
+        self.freq = freq
+
+        # —— 用“最大长度”初始化核心；实际 forward 按需覆盖 —— #
+        cfg = _AFConfigs(
+            seq_len=self.max_context_len,
+            label_len=self.label_len_cfg,
+            pred_len=self.max_pred_len,
+            enc_in=1,
+            dec_in=1,
+            c_out=1,
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            e_layers=e_layers,
+            d_layers=d_layers,
+            moving_avg=moving_avg,
+            factor=factor,
+            dropout=dropout,
+            embed=embed,
+            freq=freq,
+            activation=activation,
+            output_attention=output_attention,
+        )
+        self.core = AutoformerCore(cfg)
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _ensure_float(x: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        # 强制到 float32（或与 like 一致的 float），避免 long/float 冲突
+        want_dtype = torch.float32 if not like.is_floating_point() else like.dtype
+        return x.to(dtype=want_dtype)
+
+    def _timefeat_dim(self) -> int:
+        # 与 TimeFeatureEmbedding.freq_map 一致
+        freq_map = {"h": 4, "t": 5, "s": 6, "m": 1, "a": 1, "w": 2, "d": 3, "b": 3}
+        if self.freq not in freq_map:
+            raise ValueError(f"Unsupported freq '{self.freq}' for timeF embedding.")
+        return freq_map[self.freq]
+
+    def _make_time_marks(self, B: int, L: int, device, dtype) -> torch.Tensor:
+        # 生成全 0 的 time features（float），形状 [B, L, Dm]
+        Dm = self._timefeat_dim()
+        return torch.zeros(B, L, Dm, device=device, dtype=dtype)
+
+    # ---------- forward ----------
+
+    def forward(
+        self,
+        x: Dict[str, torch.Tensor],
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ):
+        if context_len is None:
+            context_len = self.max_context_len
+        if pred_len is None:
+            pred_len = self.max_pred_len
+
+        load = x["load"]  # [B, T, 1]
+        assert load.dim() == 3 and load.size(-1) == 1, "load 形状必须是 [B, T, 1]"
+        assert load.size(1) >= context_len + pred_len, "序列长度不足以覆盖 ctx+pred"
+
+        B, T, _ = load.shape
+        device = load.device
+
+        # 编码器输入：仅上下文
+        x_enc = load[:, :context_len, :]
+        x_enc = self._ensure_float(x_enc, like=load)
+
+        # 解码器输入：label_len 的已知历史 + pred_len 的占位
+        eff_label_len = min(self.label_len_cfg, context_len)
+        known_hist = load[:, context_len - eff_label_len : context_len, :]
+        known_hist = self._ensure_float(known_hist, like=load)
+
+        zeros_pred = torch.zeros(B, pred_len, 1, device=device, dtype=x_enc.dtype)
+        x_dec = torch.cat([known_hist, zeros_pred], dim=1)  # [B, eff_label_len+pred, 1]
+
+        # 时间标记：优先使用 batch 中的 x_mark_*；否则生成占位
+        # —— AutoformerCore 使用 DataEmbedding_wo_pos + embed='timeF' → 需要 float —— #
+        if "x_mark_enc" in x:
+            x_mark_enc = self._ensure_float(x["x_mark_enc"], like=x_enc)
+            assert (
+                x_mark_enc.shape[0] == B and x_mark_enc.shape[1] == context_len
+            ), f"x_mark_enc 形状应为 [B, {context_len}, Dm]"
+        else:
+            x_mark_enc = self._make_time_marks(B, context_len, device, x_enc.dtype)
+
+        if "x_mark_dec" in x:
+            x_mark_dec = self._ensure_float(x["x_mark_dec"], like=x_enc)
+            assert (
+                x_mark_dec.shape[0] == B
+                and x_mark_dec.shape[1] == eff_label_len + pred_len
+            ), f"x_mark_dec 形状应为 [B, {eff_label_len + pred_len}, Dm]"
+        else:
+            x_mark_dec = self._make_time_marks(
+                B, eff_label_len + pred_len, device, x_enc.dtype
+            )
+
+        # —— 动态覆盖核心长度，保证与本次 forward 完全一致 —— #
+        self.core.seq_len = int(context_len)
+        self.core.label_len = int(eff_label_len)
+        self.core.pred_len = int(pred_len)
+
+        # 前向
+        dec_out = self.core(
+            x_enc=x_enc,
+            x_mark_enc=x_mark_enc,
+            x_dec=x_dec,
+            x_mark_dec=x_mark_dec,
+            enc_self_mask=None,
+            dec_self_mask=None,
+            dec_enc_mask=None,
+        )
+        if isinstance(dec_out, tuple):
+            dec_out = dec_out[0]  # 丢掉注意力
+        dec_out = dec_out[:, -pred_len:, :]  # 稳妥截断
+        return dec_out  # [B, pred_len, 1]
+
+    # ---------- loss / predict / finetune / ckpt ----------
+
+    def loss(
+        self, pred: torch.Tensor, y: torch.Tensor, progress: Optional[float] = None
+    ) -> torch.Tensor:
+        if self.continuous_head == "huber":
+            if pred.ndim == 3 and pred.size(-1) == 1:
+                pred = pred.squeeze(-1)
+            if y.ndim == 3 and y.size(-1) == 1:
+                y = y.squeeze(-1)
+            return F.huber_loss(pred, y, delta=1.0)
+        raise NotImplementedError(f"Unsupported head: {self.continuous_head}")
+
+    @torch.no_grad()
+    def predict(
+        self, x: Dict[str, torch.Tensor], context_len: int = 168, pred_len: int = 24
+    ):
+        preds = self.forward(x, context_len, pred_len)  # [B, pred, 1]
+        return preds, preds  # 第二个返回值占位，兼容训练脚本
+
+    def unfreeze_and_get_parameters_for_finetuning(self):
+        # 需要“参数组策略”时可像我之前给 BuildMoE 的那套一样扩展；默认全量
+        return self.parameters()
+
+    def load_from_checkpoint(self, checkpoint_path: str):
+        state = torch.load(checkpoint_path, map_location="cpu")
+        sd = state.get("model", state)
+        new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
+        self.load_state_dict(new_sd, strict=False)
+
+
+# if __name__ == "__main__":
+#     model = AutoformerUnified()
+#     x = torch.randn(16, 300 + 100, 1)
+#     y = model({"load": x}, context_len=300, pred_len=100)
+#     print(y.shape)
+#     loss = model.loss(y, torch.randn(16, 100, 1))
+#     print(loss)
+#     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#     print(n_params)
+
+
 if __name__ == "__main__":
-    model = AutoformerUnified()
-    x = torch.randn(16, 300 + 100, 1)
-    y = model({"load": x}, context_len=300, pred_len=100)
-    print(y.shape)
-    loss = model.loss(y, torch.randn(16, 100, 1))
-    print(loss)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(n_params)
+    import torch
+
+    cfgs = [
+        # 你已有的 S/M/L ...
+        dict(
+            name="S",
+            d_model=256,
+            n_heads=4,
+            d_ff=1024,
+            e_layers=2,
+            d_layers=1,
+            moving_avg=25,
+            factor=3,
+            dropout=0.1,
+            label_len=48,
+        ),
+        dict(
+            name="M",
+            d_model=512,
+            n_heads=8,
+            d_ff=2048,
+            e_layers=2,
+            d_layers=1,
+            moving_avg=25,
+            factor=3,
+            dropout=0.1,
+            label_len=48,
+        ),
+        dict(
+            name="L",
+            d_model=768,
+            n_heads=12,
+            d_ff=3072,
+            e_layers=3,
+            d_layers=2,
+            moving_avg=25,
+            factor=3,
+            dropout=0.1,
+            label_len=48,
+        ),
+        # —— 新增：100M 附近的三档 —— #
+        dict(
+            name="XL-≈90M",
+            d_model=1152,
+            n_heads=16,
+            d_ff=4608,
+            e_layers=3,
+            d_layers=2,
+            moving_avg=25,
+            factor=3,
+            dropout=0.1,
+            label_len=48,
+        ),
+        dict(
+            name="XL≈100M",
+            d_model=1024,
+            n_heads=16,
+            d_ff=4096,
+            e_layers=4,
+            d_layers=3,
+            moving_avg=25,
+            factor=3,
+            dropout=0.1,
+            label_len=48,
+        ),
+        dict(
+            name="XL+≈111M",
+            d_model=1280,
+            n_heads=20,
+            d_ff=5120,
+            e_layers=3,
+            d_layers=2,
+            moving_avg=25,
+            factor=3,
+            dropout=0.1,
+            label_len=48,
+        ),
+    ]
+
+    def count_params(m: torch.nn.Module):
+        total = sum(p.numel() for p in m.parameters())
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        return total, trainable
+
+    print("== AutoformerBB 参数量检查（含 ~100M 档） ==")
+    for c in cfgs:
+        model = AutoformerBB(
+            max_context_len=336,
+            max_pred_len=168,
+            context_len=168,
+            pred_len=24,
+            d_model=c["d_model"],
+            n_heads=c["n_heads"],
+            d_ff=c["d_ff"],
+            e_layers=c["e_layers"],
+            d_layers=c["d_layers"],
+            moving_avg=c["moving_avg"],
+            factor=c["factor"],
+            dropout=c["dropout"],
+            embed="timeF",
+            freq="h",
+            label_len=c["label_len"],
+            continuous_loads=True,
+            continuous_head="huber",
+        )
+        total, trainable = count_params(model)
+        size_mb = total * 4 / (1024**2)  # fp32
+
+        print(
+            f"[{c['name']}] "
+            f"d_model={c['d_model']}, heads={c['n_heads']}, d_ff={c['d_ff']}, "
+            f"E={c['e_layers']}, D={c['d_layers']}, "
+            f"Params(total/trainable)={total:,}/{trainable:,} (~{size_mb:.2f} MB, fp32)"
+        )

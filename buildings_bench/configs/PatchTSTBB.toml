@@ -1,0 +1,19 @@
+[model]
+context_len = 168
+pred_len = 24
+d_model = 128
+n_heads = 16
+d_ff = 256
+e_layers = 3
+dropout = 0.1
+fc_dropout = 0.1
+head_dropout = 0.0
+patch_len = 16
+stride = 8
+padding_patch = ''
+revin = true
+affine = false
+subtract_last = false
+individual = false
+continuous_loads = true
+continuous_head = 'huber'

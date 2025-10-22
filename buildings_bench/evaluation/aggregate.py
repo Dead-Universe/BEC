@@ -646,10 +646,11 @@ def return_aggregate(
                 if n_nan or n_inf:
                     print(
                         f"Warning: model '{model}' ({bt}-{metric}) contains "
-                        f"{n_nan} NaN, {n_inf} inf — rows will be dropped."
+                        f"{n_nan} NaN, {n_inf} inf — NaN will be replaced with inf."
                     )
-                df["value"] = df["value"].replace(np.inf, np.nan)
-                df = df.dropna(subset=["value"])
+
+                # 把 NaN 替换成 inf
+                df["value"] = df["value"].replace(np.nan, np.inf)
 
                 if not df.empty:
                     concat_dfs.append(df)
@@ -720,7 +721,9 @@ def pretty_print(result_dict, aggregate="median"):
                         f"| {model} | {bt} | {metric} | {dataset_tag} | "
                         f"{val:.3f} ({lo:.3f}, {hi:.3f}) |"
                     )
-    print(header + "\n".join(rows))
+    final_table = header + "\n".join(rows)
+    print(final_table)
+    return final_table
 
 
 if __name__ == "__main__":

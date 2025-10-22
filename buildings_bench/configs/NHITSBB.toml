@@ -1,0 +1,18 @@
+[model]
+context_len = 168
+pred_len = 24
+activation = "ReLU"
+initialization = "glorot_uniform"
+
+stack_types = ["identity","identity","identity"]
+n_blocks = [2,2,2]        # 每个 stack 两个 block
+n_layers = [3,3,3]        # 每个 block 三层
+n_theta_hidden = [[512,512,512],[512,512,512],[512,512,512]]
+n_pool_kernel_size = [2,2,1]
+n_freq_downsample = [2,2,1]
+pooling_mode = "max"
+interpolation_mode = "linear"
+
+batch_normalization = true
+dropout_prob_theta = 0.2
+shared_weights = false
