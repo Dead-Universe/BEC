@@ -296,25 +296,29 @@ def test_with_metrics_manager_and_aggregate(
     results_dir: Path,
     transform=lambda x: x,
     inverse_transform=lambda x: x,
-    variant_name: str = "",
 ):
-    if args.ignore_scoring_rules:
-        metrics_manager = DatasetMetricsManager()
-    elif getattr(model, "continuous_loads", True):
-        use_crps = getattr(model, "continuous_head", "") == "gaussian_nll"
-        metrics_manager = DatasetMetricsManager(
-            scoring_rule=(scoring_rule_factory("crps") if use_crps else None)
-        )
-    else:
-        metrics_manager = DatasetMetricsManager(
-            scoring_rule=scoring_rule_factory("rps")
-        )
+    """支持多个 horizon（切片）独立评估，结果命名为 model:predlen_h"""
+
+    # === 为每个 horizon 准备一个 metrics_manager ===
+    managers: dict[int, DatasetMetricsManager] = {}
+    for h in args.eval_horizons:
+        if args.ignore_scoring_rules:
+            mm = DatasetMetricsManager()
+        elif getattr(model, "continuous_loads", True):
+            use_crps = getattr(model, "continuous_head", "") == "gaussian_nll"
+            mm = DatasetMetricsManager(
+                scoring_rule=(scoring_rule_factory("crps") if use_crps else None)
+            )
+        else:
+            mm = DatasetMetricsManager(scoring_rule=scoring_rule_factory("rps"))
+        managers[h] = mm
 
     model.eval()
     dataset_name = args.dataset
     building_id_counter = 0
 
     for batch in test_loader:
+        # building_type 掩码
         if "building_type" in batch and isinstance(
             batch["building_type"], torch.Tensor
         ):
@@ -336,6 +340,7 @@ def test_with_metrics_manager_and_aggregate(
         ctx_len = int(batch.pop("context_len"))
         pred_len = int(batch.pop("pred_len"))
 
+        # === 输入用 transform 过的 load ===
         trans_batch = {k: v for k, v in batch.items()}
         trans_batch["load"] = transform(batch["load"])
 
@@ -345,97 +350,98 @@ def test_with_metrics_manager_and_aggregate(
         else:
             preds, distribution_params = out, None
 
-        y_true = (
+        y_true_full = (
             batch["load"][:, ctx_len : ctx_len + pred_len, 0]
             if batch["load"].ndim == 3
             else batch["load"][:, ctx_len : ctx_len + pred_len]
         )
 
         preds = preds.detach().float().cpu()
-        y_true = y_true.detach().float().cpu()
-        try:
-            preds = inverse_transform(preds)
-        except Exception:
-            pass
+        y_true_full = y_true_full.detach().float().cpu()
 
-        if getattr(model, "continuous_head", "") != "gaussian_nll":
-            distribution_params = None
-        else:
-            if isinstance(distribution_params, torch.Tensor):
-                distribution_params = distribution_params.detach().float().cpu()
+        # === 遍历 horizon，切片评估 ===
+        for horizon in args.eval_horizons:
+            if horizon > preds.shape[1]:
+                continue
 
-        if preds.ndim == 3 and preds.size(-1) == 1:
-            preds = preds.squeeze(-1)
-        if y_true.ndim == 3 and y_true.size(-1) == 1:
-            y_true = y_true.squeeze(-1)
+            preds_h = inverse_transform(preds[:, :horizon])
+            y_true_h = y_true_full[:, :horizon]
 
-        bsz = preds.size(0)
-        for i in range(bsz):
-            building_id_counter += 1
-            if "building_id" in batch:
-                building_name = f"{batch['building_id'][i]}"
-            else:
-                building_name = f"{dataset_name}-b{building_id_counter:06d}"
-            mask_i = building_types_mask[i]
-            metrics_manager(
-                dataset_name,
-                building_name,
-                y_true[i : i + 1],
-                preds[i : i + 1],
-                mask_i.unsqueeze(0),
-                y_categories=None,
-                y_distribution_params=(
-                    distribution_params[i : i + 1]
-                    if isinstance(distribution_params, torch.Tensor)
-                    else None
-                ),
-                centroids=None,
-            )
+            if preds_h.ndim == 3 and preds_h.size(-1) == 1:
+                preds_h = preds_h.squeeze(-1)
+            if y_true_h.ndim == 3 and y_true_h.size(-1) == 1:
+                y_true_h = y_true_h.squeeze(-1)
 
+            bsz = preds_h.size(0)
+            for i in range(bsz):
+                building_id_counter += 1
+                if "building_id" in batch:
+                    building_name = f"{batch['building_id'][i]}:h{horizon}"
+                else:
+                    building_name = (
+                        f"{dataset_name}-b{building_id_counter:06d}:h{horizon}"
+                    )
+                mask_i = building_types_mask[i]
+                managers[horizon](
+                    dataset_name,
+                    building_name,
+                    y_true_h[i : i + 1],
+                    preds_h[i : i + 1],
+                    mask_i.unsqueeze(0),
+                )
+
+    # === 每个 horizon 独立 summary + aggregate ===
     results_dir.mkdir(parents=True, exist_ok=True)
-    variant = f":{variant_name}" if variant_name else ""
-    metrics_file = results_dir / f"metrics_{args.model}{variant}.csv"
-    scoring_file = results_dir / f"scoring_rule_{args.model}{variant}.csv"
 
-    if metrics_manager.scoring_rule:
-        metrics_df, scoring_df = metrics_manager.summary()
-        metrics_df.to_csv(metrics_file, index=False)
-        scoring_df.to_csv(scoring_file, index=False)
-        print(
-            f"[Results] metrics -> {metrics_file}\n[Results] scoring_rule -> {scoring_file}"
+    for horizon, mm in managers.items():
+        # 保持 {model}:{predlen}_{horizon} 命名
+        model_tag = f"{args.model}:{args.pred_len}_{horizon}"
+        metrics_file = results_dir / f"metrics_{model_tag}.csv"
+        scoring_file = results_dir / f"scoring_rule_{model_tag}.csv"
+
+        if mm.scoring_rule:
+            metrics_df, scoring_df = mm.summary()
+            metrics_df.to_csv(metrics_file, index=False)
+            scoring_df.to_csv(scoring_file, index=False)
+            print(
+                f"[Results:h{horizon}] metrics -> {metrics_file}\n"
+                f"[Results:h{horizon}] scoring_rule -> {scoring_file}"
+            )
+        else:
+            metrics_df = mm.summary()
+            metrics_df.to_csv(metrics_file, index=False)
+            print(f"[Results:h{horizon}] metrics -> {metrics_file}")
+
+        # === aggregate 输出 ===
+        metric_names = [m.name for m in mm.metrics_list]
+        if mm.scoring_rule:
+            metric_names += [mm.scoring_rule.name]
+
+        print(f"\nAggregates (real, {model_tag})")
+        real_med = aggregate.return_aggregate(
+            model_list=[model_tag],
+            results_dir=str(results_dir),
+            experiment=args.experiment_tag,
+            metrics=metric_names,
+            aggregate="median",
+            exclude_simulated=True,
         )
-    else:
-        metrics_df = metrics_manager.summary()
-        metrics_df.to_csv(metrics_file, index=False)
-        print(f"[Results] metrics -> {metrics_file}")
+        aggregate.pretty_print(real_med, aggregate="median")
 
-    model_tag = f"{args.model}{variant}"
-    print(model_tag)
-    print(args.model)
-    metric_names = [m.name for m in metrics_manager.metrics_list]
-    if metrics_manager.scoring_rule:
-        metric_names += [metrics_manager.scoring_rule.name]
+        real_mean = aggregate.return_aggregate(
+            model_list=[model_tag],
+            results_dir=str(results_dir),
+            experiment=args.experiment_tag,
+            metrics=metric_names,
+            aggregate="mean",
+            exclude_simulated=True,
+        )
+        ans = aggregate.pretty_print(real_mean, aggregate="mean")
 
-    print("\nAggregates (real)")
-    real_med = aggregate.return_aggregate(
-        model_list=[model_tag],
-        results_dir=str(results_dir),
-        experiment=args.experiment_tag,
-        metrics=metric_names,
-        aggregate="median",
-        exclude_simulated=True,
-    )
-    aggregate.pretty_print(real_med, aggregate="median")
-
-    real_mean = aggregate.return_aggregate(
-        model_list=[model_tag],
-        results_dir=str(results_dir),
-        experiment=args.experiment_tag,
-        metrics=metric_names,
-        aggregate="mean",
-        exclude_simulated=True,
-    )
-    aggregate.pretty_print(real_mean, aggregate="mean")
+        # 追加写入文件
+        log_file = results_dir / "aggregates_summary.txt"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(ans + "\n\n")
 
 
 # =========================
@@ -585,49 +591,49 @@ def main(args, model_args: Dict):
         f"scaler={args.apply_scaler_transform} seed={args.random_seed} pretrained={bool(args.pretrained_path)}"
     )
 
-    # for epoch in range(1, args.epochs + 1):
-    #     model.train()
-    #     total_loss = 0.0
-    #     for batch in train_loader:
-    #         for k, v in list(batch.items()):
-    #             if isinstance(v, torch.Tensor):
-    #                 batch[k] = v.to(device)
-    #         ctx_len = int(batch.pop("context_len"))
-    #         pred_len = int(batch.pop("pred_len"))
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for batch in train_loader:
+            for k, v in list(batch.items()):
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+            ctx_len = int(batch.pop("context_len"))
+            pred_len = int(batch.pop("pred_len"))
 
-    #         batch["load"] = transform(batch["load"])
+            batch["load"] = transform(batch["load"])
 
-    #         preds = model(batch, context_len=ctx_len, pred_len=pred_len)
-    #         tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
+            preds = model(batch, context_len=ctx_len, pred_len=pred_len)
+            tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
 
-    #         loss = criterion(preds, tgt)
-    #         optimizer.zero_grad()
-    #         loss.backward()
-    #         for g in optimizer.param_groups:
-    #             torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
-    #         optimizer.step()
-    #         total_loss += loss.item()
+            loss = criterion(preds, tgt)
+            optimizer.zero_grad()
+            loss.backward()
+            for g in optimizer.param_groups:
+                torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
+            optimizer.step()
+            total_loss += loss.item()
 
-    #     scheduler.step()
-    #     avg_loss = total_loss / max(1, len(train_loader))
-    #     val_rmse, val_mae = quick_eval_rmse_mae(model, val_loader, device, transform)
-    #     print(
-    #         f"[Epoch {epoch:03d}] train_loss={avg_loss:.6f} val_RMSE={val_rmse:.6f} val_MAE={val_mae:.6f}"
-    #     )
+        scheduler.step()
+        avg_loss = total_loss / max(1, len(train_loader))
+        val_rmse, val_mae = quick_eval_rmse_mae(model, val_loader, device, transform)
+        print(
+            f"[Epoch {epoch:03d}] train_loss={avg_loss:.6f} val_RMSE={val_rmse:.6f} val_MAE={val_mae:.6f}"
+        )
 
-    #     if val_rmse < best_val - 1e-9:
-    #         best_val, best_epoch, no_improve = val_rmse, epoch, 0
-    #         save_model_checkpoint(
-    #             model, optimizer, scheduler, epoch, best_val, best_ckpt
-    #         )
-    #         print(f"  >> Saved best -> {best_ckpt} (val_RMSE={best_val:.6f})")
-    #     else:
-    #         no_improve += 1
-    #         if args.patience > 0 and no_improve >= args.patience:
-    #             print(
-    #                 f"==> Early stop at epoch {epoch}, best@{best_epoch}={best_val:.6f}"
-    #             )
-    #             break
+        if val_rmse < best_val - 1e-9:
+            best_val, best_epoch, no_improve = val_rmse, epoch, 0
+            save_model_checkpoint(
+                model, optimizer, scheduler, epoch, best_val, best_ckpt
+            )
+            print(f"  >> Saved best -> {best_ckpt} (val_RMSE={best_val:.6f})")
+        else:
+            no_improve += 1
+            if args.patience > 0 and no_improve >= args.patience:
+                print(
+                    f"==> Early stop at epoch {epoch}, best@{best_epoch}={best_val:.6f}"
+                )
+                break
 
     _step, _best = load_model_checkpoint(
         best_ckpt,
@@ -651,7 +657,6 @@ def main(args, model_args: Dict):
         results_dir=results_dir,
         transform=transform,
         inverse_transform=inverse_transform,
-        variant_name=args.variant_name,
     )
 
 
@@ -668,7 +673,7 @@ if __name__ == "__main__":
         "--model", required=True, help="BuildMoE / DLinearRegression / NLinear 等"
     )
     p.add_argument("--ctx_len", type=int, default=168)
-    p.add_argument("--pred_len", type=int, default=24)
+    p.add_argument("--pred_len", type=int, default=168)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--weight_decay", type=float, default=0.01)
@@ -683,6 +688,13 @@ if __name__ == "__main__":
         type=str,
         default="zero_shot",
         help="aggregate 用的 experiment 标签",
+    )
+    p.add_argument(
+        "--eval_horizons",
+        type=int,
+        nargs="+",
+        default=[1, 6, 12, 24, 48, 96, 168],
+        help="测试时切片长度列表",
     )
     p.add_argument(
         "--apply_scaler_transform",
