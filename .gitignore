@@ -15,3 +15,5 @@ scratch/
 tutorials/.ipynb_checkpoints/
 dev/
 logs/
+logs_all/
+results_finetune/
