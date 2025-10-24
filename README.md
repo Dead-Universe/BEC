@@ -3,7 +3,6 @@
 - **Building-MoE**: Transformer encoder–decoder with sparse MoE (Top-k) feed-forward layers  
 - **CLRS** (Closed-Loop Routing Scheduler): stagewise temp/noise, entropy feedback, short pulses, expert revival  
 - **LBL** (Load Balancing Loss) + **Huber** loss: robust + balanced experts  
-- **Single forward pass** covers horizons {1, 6, 12, 24, 48, 96, 168} hours  
 - **Engineering compliance**: CVRMSE / NMAE / NMBE with ASHRAE Guideline 14 (hourly) thresholds
 
 ## Installation
