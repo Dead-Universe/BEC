@@ -3,7 +3,7 @@
 - **Building-MoE**: Transformer encoder–decoder with sparse MoE (Top-k) feed-forward layers  
 - **CLRS** (Closed-Loop Routing Scheduler): stagewise temp/noise, entropy feedback, short pulses, expert revival  
 - **LBL** (Load Balancing Loss) + **Huber** loss: robust + balanced experts  
-- **Engineering compliance**: CVRMSE / NMAE / NMBE with ASHRAE Guideline 14 (hourly) thresholds
+- **Engineering compliance**: CVRMSE / NMBE substantially within ASHRAE Guideline 14 (hourly) thresholds
 
 ## Installation
 
@@ -31,7 +31,7 @@ pip install -e ".[benchmark]"
 Due to a PyPI limitation, we have to install `faiss-gpu` (for KMeans) by directly downloading the wheel from [https://github.com/kyamagu/faiss-wheels/releases/](https://github.com/kyamagu/faiss-wheels/releases/).
 Download the wheel for the python version you are using, then install it in your environment.
 
-For example:
+For example:   例如:
 
 ```bash
 wget https://github.com/kyamagu/faiss-wheels/releases/download/v1.7.3/faiss_gpu-1.7.3-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -43,16 +43,16 @@ pip install faiss_gpu-1.7.3-cp38-cp38-manylinux2014_x86_64.whl
 
 The pretraining dataset and evaluation data is available for download [here](https://data.openei.org/submissions/5859) as tar files, or can be accessed via AWS S3 [here](https://data.openei.org/s3_viewer?bucket=oedi-data-lake&prefix=buildings-bench). The benchmark datasets are < 1GB in size in total, but the pretraining data is ~110GB in size.
 
-The pretraining data is divided into 4 compressed files
+The pretraining data is divided into 4 compressed files预训练数据被分为 4 个压缩文件。
 - `comstock_amy2018.tar.gz`
 - `comstock_tmy3.tar.gz`
 - `resstock_amy2018.tar.gz`
 - `resstock_tmy3.tar.gz`
 
-and one compressed file for the metadata
+and one compressed file for the metadata以及一个压缩文件用于元数据
 - `metadata.tar.gz`
 
-The evaluation datasets are compressed into a single file
+The evaluation datasets are compressed into a single file评估数据集被压缩成一个单独的文件。
 - `BuildingsBench.tar.gz`
 
 Download all files to a folder on a storage device with at least 250GB of free space. Then, decompress all of the downloaded files. There will be a new subdirectory called `BuildingsBench`. **This is the data directory, which is different than the Github code repository, although both folders are named "BuildingsBench".**
