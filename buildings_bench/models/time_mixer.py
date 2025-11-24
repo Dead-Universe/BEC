@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import math
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 from buildings_bench.models.base_model import BaseModel
 import torch
 import torch.nn as nn
@@ -986,6 +986,260 @@ class TimeMixerBB(BaseModel):
             state = state["model"]
         state = {k.replace("module.", ""): v for k, v in state.items()}
         self.load_state_dict(state, strict=False)
+
+
+# 你自己的基础类：与 PatchTST_A 相同的 BaseModel（保持一致即可）
+class BaseModel(nn.Module):
+    def __init__(
+        self, context_len: int, pred_len: int, *, continuous_loads: bool = True
+    ):
+        super().__init__()
+        self.context_len = int(context_len)
+        self.pred_len = int(pred_len)
+        self.continuous_loads = bool(continuous_loads)
+
+    def unfreeze_and_get_parameters_for_finetuning(self):
+        for p in self.parameters():
+            p.requires_grad = True
+        return self.parameters()
+
+
+# ====== 预训练版 TimeMixer（方案A：固定最大上下文与最大地平线） ======
+class LoadForecastingTimeMixer_A(BaseModel):
+    """
+    与 LoadForecastingPatchTST_A 同构的 TimeMixer 预训练版：
+    - 训练/推理时，脚本可在 1~max_context_len 之间任意选择 context_len；
+    - 模型内部会先对齐到 max_context_len（左侧重复填充/右裁剪），
+      Backbone 统一用 (B, max_context_len, 1) 输入，再输出 (B, max_pred_len, 1)；
+    - 最终只返回前 pred_len 个时间步的预测结果；
+    - Loss/预测/加载权重 接口与 PatchTST_A 一致，方便脚本统一调用。
+    """
+
+    def __init__(
+        self,
+        # 固定最大长度（与 PatchTST_A 一致）
+        max_context_len: int = 336,
+        max_pred_len: int = 168,
+        # 默认训练时的“推荐”片段（可被 forward/predict 覆盖）
+        context_len: int = 336,
+        pred_len: int = 168,
+        # TimeMixer 主干配置（给出常用默认，便于直接跑）
+        d_model: int = 512,
+        d_ff: int = 1024,
+        e_layers: int = 2,
+        down_sampling_layers: int = 2,
+        down_sampling_window: int = 2,
+        down_sampling_method: str = "avg",
+        moving_avg: int = 25,
+        decomp_method: str = "moving_avg",
+        top_k: int = 5,
+        embed: str = "timeF",
+        freq: str = "h",
+        dropout: float = 0.1,
+        channel_independence: int = 0,
+        use_norm: int = 1,
+        # 任务/损失
+        continuous_loads: bool = True,
+        continuous_head: Literal["mse", "gaussian_nll", "huber"] = "huber",
+        huber_delta: float = 1.0,
+        # 输入输出通道
+        enc_in: int = 1,
+        c_out: int = 1,
+        **kwargs,
+    ):
+        super().__init__(
+            context_len=max_context_len,
+            pred_len=max_pred_len,
+            continuous_loads=continuous_loads,
+        )
+        self.max_context_len = int(max_context_len)
+        self.max_pred_len = int(max_pred_len)
+        self.continuous_head = continuous_head
+        self.huber_delta = float(huber_delta)
+
+        # === TimeMixer Backbone 配置（固定用最大上下文 / 最大地平线）===
+        try:
+            from easydict import EasyDict as edict
+        except ImportError:
+            # 兜底：无 easydict 也能跑
+            class edict(dict):
+                __getattr__ = dict.get
+                __setattr__ = dict.__setitem__
+                __delattr__ = dict.__delitem__
+
+        tm_cfg = edict(
+            dict(
+                # 任务/输入输出维
+                task_name="long_term_forecast",
+                seq_len=self.max_context_len,
+                label_len=0,
+                pred_len=self.max_pred_len,
+                enc_in=enc_in,
+                c_out=c_out,
+                # 结构参数
+                d_model=d_model,
+                d_ff=d_ff,
+                e_layers=e_layers,
+                down_sampling_layers=down_sampling_layers,
+                down_sampling_window=down_sampling_window,
+                down_sampling_method=down_sampling_method,
+                moving_avg=moving_avg,
+                decomp_method=decomp_method,
+                top_k=top_k,
+                # 时间嵌入与频率
+                embed=embed,
+                freq=freq,
+                # 归一化/丢弃
+                dropout=dropout,
+                channel_independence=channel_independence,
+                use_future_temporal_feature=False,
+                use_norm=use_norm,
+                # 兼容字段
+                num_class=0,
+                individual=False,
+            )
+        )
+
+        self.backbone = Model(tm_cfg)
+
+        # 输出头（按需，可直接恒等/或线性投影；保持与 PatchTST_A 风格一致）
+        self.out_dim = 1 if self.continuous_head in ("mse", "huber") else 2
+        self.head = nn.Linear(1, self.out_dim)
+
+    # 与 PatchTST_A 相同的对齐策略：左侧复制填充到 max_context_len，或右裁剪
+    def _align_context(self, ctx: torch.Tensor) -> torch.Tensor:
+        """
+        ctx: (B, L, 1)
+        返回: (B, max_context_len, 1)
+        """
+        B, L, C = ctx.shape
+        if L == self.max_context_len:
+            return ctx
+        elif L < self.max_context_len:
+            pad_len = self.max_context_len - L
+            # 用首帧复制填充（可替换为零填充/均值填充，保持与 PatchTST_A 一致即可）
+            pad = ctx[:, :1, :].expand(B, pad_len, C)
+            return torch.cat([pad, ctx], dim=1)
+        else:
+            # 超长就取最近的 max_context_len
+            return ctx[:, -self.max_context_len :, :]
+
+    def _call_backbone(self, x_enc: torch.Tensor) -> torch.Tensor:
+        """
+        封装对 TimeMixer 主干的调用，兼容不同实现：
+        - 优先尝试 backbone(x_enc) -> (B, max_pred_len, 1)
+        - 若报 TypeError（需要额外时间特征），则构造全 0 的时间特征再调用
+          以便“即插即用”，不改你的训练脚本
+        """
+        try:
+            out = self.backbone(x_enc)  # 常见实现
+            return out
+        except TypeError:
+            # 构造 dummy 时间特征
+            B, L, C = x_enc.shape
+            # 经验维度：与常见 TimeMixer 时间嵌入输入对齐（小时=4；分钟=5；秒=6）
+            freq = getattr(
+                self.backbone, "configs", getattr(self.backbone, "config", None)
+            )
+            freq = (getattr(freq, "freq", "h") or "h").lower()
+            if freq in ("h",):
+                d_inp = 4
+            elif freq in ("t", "min"):
+                d_inp = 5
+            elif freq in ("s",):
+                d_inp = 6
+            else:
+                d_inp = 4
+            x_mark_enc = torch.zeros(B, L, d_inp, device=x_enc.device)
+            x_dec = torch.zeros(B, self.max_pred_len, 1, device=x_enc.device)
+            x_mark_dec = torch.zeros(B, self.max_pred_len, d_inp, device=x_enc.device)
+            return self.backbone(x_enc, x_mark_enc, x_dec, x_mark_dec)
+
+    # ---------- forward ----------
+    def forward(
+        self,
+        x: Dict[str, torch.Tensor],
+        context_len: Optional[int] = None,
+        pred_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        x: {"load": (B, T, 1)}
+        context_len/pred_len: 运行时覆盖（训练脚本会随机设置 1~336 的 context_len）
+        """
+        if context_len is None:
+            context_len = self.max_context_len
+        if pred_len is None:
+            pred_len = self.max_pred_len
+        if pred_len > self.max_pred_len:
+            raise ValueError(
+                f"pred_len({pred_len}) > max_pred_len({self.max_pred_len})"
+            )
+
+        load = x["load"]  # (B, T, 1)
+        assert load.dim() == 3 and load.size(-1) == 1
+        assert (
+            load.size(1) >= context_len
+        ), f"need T >= context_len, got {load.size(1)} < {context_len}"
+
+        # 1) 取脚本当前的 context_len 片段；2) 对齐到 max_context_len
+        ctx = self._align_context(load[:, :context_len, :])  # (B, max_context_len, 1)
+
+        # 3) 送入 TimeMixer 主干，得到 (B, max_pred_len, 1) 的全地平线预测
+        full_pred = self._call_backbone(ctx)
+
+        # 4) 线性头（与 PatchTST_A 一致：可用于 G-NLL / MSE / Huber）
+        full_pred = self.head(full_pred)  # (B, max_pred_len, out_dim)
+
+        # 5) 截取到当前 pred_len
+        return full_pred[:, :pred_len, :]
+
+    # ---------- loss ----------
+    def loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        pred: (B, L, out_dim)；y: (B, L, 1)
+        """
+        if not self.continuous_loads:
+            B, L, _ = pred.shape
+            return F.cross_entropy(pred.reshape(B * L, -1), y.long().reshape(B * L))
+
+        if self.continuous_head == "huber":
+            return F.huber_loss(
+                pred[..., :1], y, delta=self.huber_delta, reduction="mean"
+            )
+        elif self.continuous_head == "mse":
+            return F.mse_loss(pred[..., :1], y, reduction="mean")
+        else:
+            # Gaussian NLL 头：pred[..., :1] 为均值，pred[..., 1:] 为（正）标准差的软参数
+            mu, sigma_sq = pred[..., :1], F.softplus(pred[..., 1:]) ** 2
+            return (
+                0.5 * (torch.log(2 * torch.pi * sigma_sq) + (y - mu) ** 2 / sigma_sq)
+            ).mean()
+
+    # ---------- predict ----------
+    @torch.no_grad()
+    def predict(
+        self,
+        x: Dict[str, torch.Tensor],
+        context_len: int = 336,
+        pred_len: int = 168,
+    ):
+        preds = self.forward(x, context_len=context_len, pred_len=pred_len)
+        # 与 PatchTST_A 对齐：返回 (mean, raw)
+        if self.continuous_head in ("mse", "huber"):
+            return preds[..., :1], preds
+        else:
+            return preds[..., :1], preds
+
+    # ---------- finetune 参数 ----------
+    def unfreeze_and_get_parameters_for_finetuning(self):
+        return super().unfreeze_and_get_parameters_for_finetuning()
+
+    # ---------- checkpoint 加载 ----------
+    def load_from_checkpoint(self, checkpoint_path: str, strict: bool = False):
+        state = torch.load(checkpoint_path, map_location="cpu")
+        state = state.get("model", state)
+        state = {k.replace("module.", ""): v for k, v in state.items()}
+        self.load_state_dict(state, strict=strict)
 
 
 def count_params(m: torch.nn.Module):

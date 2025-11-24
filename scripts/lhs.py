@@ -1,24 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-finetune_university_cofactor.py
-
-微调 BuildMoE / DLinearRegression（或其他基于 BaseModel 的模型）
-在 BuildingsBench 的 'university' / 'cofactor' 数据集上，并使用
-DatasetMetricsManager + aggregate 在测试集评估、导出 CSV、打印聚合结果。
-
-修正：
-- DataLoader 不再应用 Box-Cox 转换
-- 训练/验证时手动 transform 到 Box-Cox 空间
-- 测试/评估时 inverse_transform 回到实量纲
-"""
 
 import argparse
-import inspect
 import math
 import os
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
+import inspect
+import pandas as pd
 
 import torch
 from torch.utils.data import DataLoader, random_split, ConcatDataset
@@ -418,16 +407,12 @@ def test_with_metrics_manager_and_aggregate(
         if mm.scoring_rule:
             metric_names += [mm.scoring_rule.name]
 
+        if args.variant_name:
+            args.experiment_tag = f"{args.experiment_tag}_{args.variant_name}"
+        if args.lhs_run is not None:
+            args.experiment_tag = f"{args.experiment_tag}_lhs{args.lhs_run}"
+
         print(f"\nAggregates (real, {model_tag})")
-        real_med = aggregate.return_aggregate(
-            model_list=[model_tag],
-            results_dir=str(results_dir),
-            experiment=args.experiment_tag,
-            metrics=metric_names,
-            aggregate="median",
-            exclude_simulated=True,
-        )
-        aggregate.pretty_print(real_med, aggregate="median")
 
         real_mean = aggregate.return_aggregate(
             model_list=[model_tag],
@@ -531,11 +516,20 @@ def main(args, model_args: Dict):
     )
     ds_list = []
     for bid, bldg_ds in gen:
+        # >>> 如果指定了单栋，则仅取该楼
+        if args.single_building is not None:
+            if bid == args.single_building:
+                ds_list = [bldg_ds]
+                break
+            continue
+
+        # >>> 原本的 subtype 过滤逻辑（不变）
         if args.dataset.startswith("cofactor:"):
             subtype = args.dataset.split(":", 1)[1]
             allow = set(cofactor_type.get(subtype, []))
             if bid not in allow:
                 continue
+
         ds_list.append(bldg_ds)
     if len(ds_list) == 0:
         raise RuntimeError("空数据集：未收集到任何楼栋子数据集")
@@ -576,6 +570,48 @@ def main(args, model_args: Dict):
     model = model.to(device)
     load_pretrained_if_any(model, args.pretrained_path, device)
 
+    # >>> ADD: 从 LHS CSV 注入 CLRS 超参（支持你的变量名；后注释为论文符号）
+    chosen_row = None
+    if args.clrs_plan_csv is not None:
+        plan = pd.read_csv(args.clrs_plan_csv)
+        idx = args.lhs_run if args.lhs_run is not None else 0
+        if idx < 0 or idx >= len(plan):
+            raise IndexError(f"--lhs_run 超出范围：{idx} / {len(plan)}")
+        chosen_row = plan.iloc[idx]
+
+        # 兼容两种写法：phi1/phi2 或 fixed_phi1/fixed_phi2
+        phi1 = chosen_row.get("phi1", None)
+        phi2 = chosen_row.get("phi2", None)
+        if phi1 is None and "fixed_phi1" in chosen_row:
+            phi1 = chosen_row["fixed_phi1"]
+        if phi2 is None and "fixed_phi2" in chosen_row:
+            phi2 = chosen_row["fixed_phi2"]
+
+        if hasattr(model, "update_clrs_config"):
+            model.update_clrs_config(
+                rho_star=chosen_row.get("rho_star", None),  # ρ* (rho_star)
+                k_fb=chosen_row.get("k_fb", None),  # k_fb
+                c_pulse=chosen_row.get("c_pulse", None),  # c_pulse
+                tau_hi=chosen_row.get("tau_hi", None),  # τ_hi
+                sigma_hi=chosen_row.get("sigma_hi", None),  # σ_hi
+                phi1=phi1,  # φ1
+                phi2=phi2,  # φ2
+                lambda_aux=chosen_row.get("lambda_aux", None),  # λ_aux
+            )
+        else:
+            print("⚠️ 模型没有 update_clrs_config()，跳过 CLRS 超参注入。")
+
+        # 可选：把当前 run 的配置写到 ckpt_dir 便于复现
+        try:
+            (Path(args.ckpt_dir) / "chosen_clrs_config.csv").parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            chosen_row.to_frame().T.to_csv(
+                Path(args.ckpt_dir) / f"chosen_clrs_config_run{idx}.csv", index=False
+            )
+        except Exception as _e:
+            print(f"写出 chosen_clrs_config 失败：{_e}")
+
     params = model.unfreeze_and_get_parameters_for_finetuning()
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
@@ -586,14 +622,16 @@ def main(args, model_args: Dict):
     best_ckpt = ckpt_dir / f"{args.dataset}_{args.model}_{args.pred_len}_best.pt"
     best_val, best_epoch, no_improve = float("inf"), -1, 0
 
+    # >>> ADD: 计算总步数用于 progress
+    total_steps = max(1, args.epochs * len(train_loader))
+    global_step = 0
+
     print(
         f"==> Train | dataset={args.dataset} model={args.model} ctx={args.ctx_len} "
         f"pred={args.pred_len} bs={args.batch_size} lr={args.lr} wd={args.weight_decay} "
-        f"scaler={args.apply_scaler_transform} seed={args.random_seed} pretrained={bool(args.pretrained_path)}"
+        f"scaler={args.apply_scaler_transform} seed={args.random_seed} pretrained={bool(args.pretrained_path)} "
+        f"total_steps={total_steps}"
     )
-
-    total_steps = max(1, args.epochs * len(train_loader))
-    global_step = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -609,6 +647,8 @@ def main(args, model_args: Dict):
 
             preds = model(batch, context_len=ctx_len, pred_len=pred_len)
             tgt = batch["load"][:, ctx_len : ctx_len + pred_len]
+
+            # >>> CHANGE: 把 progress 传进 criterion（如果支持）
             progress = global_step / total_steps
             if (
                 inspect.signature(criterion).parameters.get("progress", None)
@@ -623,8 +663,9 @@ def main(args, model_args: Dict):
             for g in optimizer.param_groups:
                 torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
             optimizer.step()
-            global_step += 1
             total_loss += loss.item()
+
+            global_step += 1
 
         scheduler.step()
         avg_loss = total_loss / max(1, len(train_loader))
@@ -657,9 +698,6 @@ def main(args, model_args: Dict):
         strict=False,
     )
 
-    test_rmse, test_mae = quick_eval_rmse_mae(model, test_loader, device, transform)
-    print(f"[Test@Best] RMSE={test_rmse:.6f} MAE={test_mae:.6f}")
-
     results_dir = Path(args.results_path)
     test_with_metrics_manager_and_aggregate(
         args=args,
@@ -677,13 +715,9 @@ def main(args, model_args: Dict):
 # =========================
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    valid_datasets = [
-        "university",
-        "university15t",
-        "university1t",
-        "university30t",
-        "cofactor",
-    ] + [f"cofactor:{k}" for k in cofactor_type.keys()]
+    valid_datasets = ["university", "cofactor"] + [
+        f"cofactor:{k}" for k in cofactor_type.keys()
+    ]
     p.add_argument("--dataset", required=True, choices=valid_datasets)
     p.add_argument(
         "--model", required=True, help="BuildMoE / DLinearRegression / NLinear 等"
@@ -709,7 +743,7 @@ if __name__ == "__main__":
         "--eval_horizons",
         type=int,
         nargs="+",
-        default=[1, 6, 12, 24, 48, 96, 168],
+        default=[168],
         help="测试时切片长度列表",
     )
     p.add_argument(
@@ -721,6 +755,26 @@ if __name__ == "__main__":
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--pretrained_path", type=str, default="")
     p.add_argument("--ignore_scoring_rules", action="store_true")
+
+    # >>> ADD: LHS 搜索控制
+    p.add_argument(
+        "--clrs_plan_csv",
+        type=Path,
+        default=None,
+        help="LHS 计划 CSV 路径（含 rho_star,k_fb,c_pulse,tau_hi,sigma_hi,phi1/phi2 或 fixed_phi1/fixed_phi2,lambda_aux 等列）",
+    )
+    p.add_argument(
+        "--lhs_run",
+        type=int,
+        default=None,
+        help="选择 CSV 的第几行（0-based）。不传则默认 0 行",
+    )
+    p.add_argument(
+        "--single_building",
+        type=str,
+        default=None,
+        help="如指定，则只微调该 building_id（覆盖 cofactor:Subtype 的楼选择）",
+    )
 
     args = p.parse_args()
 

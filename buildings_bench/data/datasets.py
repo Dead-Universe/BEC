@@ -15,8 +15,8 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
     """PyTorch Dataset for a single building's energy timeseries (a Pandas Dataframe)
       with a timestamp index and a `power` column.
 
-    Used to iterate over mini-batches of 192-hour timeseries
-    (168 hours of context, 24 hours prediction horizon).
+    Used to iterate over mini-batches of timeseries windows
+    (e.g., 168 context steps + 24 prediction horizon).
     """
 
     def __init__(
@@ -34,22 +34,7 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
         weather_transform_path: Path | None = None,
         building_name: str | None = None,
     ):
-        """
-        Args:
-            dataframe (pd.DataFrame): Pandas DataFrame with a timestamp index and a 'power' column.
-            building_latlon (List[float]): Latitude and longitude of the building.
-            building_type (BuildingTypes): Building type for the dataset.
-            context_len (int, optional): Length of context. Defaults to 168.
-            pred_len (int, optional): Length of prediction. Defaults to 24.
-            sliding_window (int, optional): Stride for sliding window to split timeseries into test samples. Defaults to 24.
-            apply_scaler_transform (str, optional): Apply scaler transform {boxcox,standard} to the load. Defaults to ''.
-            scaler_transform_path (Path, optional): Path to the pickled data for BoxCox transform. Defaults to None.
-            is_leap_year (bool, optional): Is the year a leap year? Defaults to False.
-            weather_dataframe (pd.DataFrame, optional): Weather timeseries data. Defaults to None.
-            weather_transform_path (Path, optional): Path to the pickled data for weather transform. Defaults to None.
-        """
         self.building_name = building_name
-        self.df = dataframe
         self.building_type = building_type
         self.context_len = context_len
         self.pred_len = pred_len
@@ -57,6 +42,23 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
         self.apply_scaler_transform = apply_scaler_transform
         self.weather_df = weather_dataframe
         self.weather_transform_path = weather_transform_path
+
+        df = dataframe.sort_index()
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+
+        # 自动推断采样间隔（比如 15T、1H）
+        inferred_freq = pd.infer_freq(df.index)
+        if inferred_freq is None:
+            # 若推断失败，默认 15 分钟
+            inferred_freq = "1H"
+        full_index = pd.date_range(df.index.min(), df.index.max(), freq=inferred_freq)
+
+        # 重索引并用 0 填充
+        df = df.reindex(full_index, fill_value=0)
+        self.df = df
+
+        # ------------------------------------------
         self.normalized_latlon = transforms.LatLonTransform().transform_latlon(
             building_latlon
         )
@@ -112,12 +114,9 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
         if self.weather_df is None:
             return sample
         else:
-
             weather_df = self.weather_df.iloc[
                 seq_ptr - self.context_len : seq_ptr + self.pred_len
             ]
-
-            # transform
             weather_transform = StandardScalerTransform()
             if "timestamp" in weather_df.columns:
                 weather_df = weather_df.drop(columns=["timestamp"])
@@ -130,7 +129,6 @@ class TorchBuildingDataset(torch.utils.data.Dataset):
                         ]
                     }
                 )
-
             return sample
 
 

@@ -70,6 +70,9 @@ class BalancedMoEMixin(nn.Module):
             lambda_layer=1.0,  # 逐层 LBL 权重
             tau_bounds=(1.0, 3.0),  # 温度范围
             sigma_bounds=(0.0, 0.1),  # 噪声范围
+            # 新增：消融相关开关
+            enable_stage_schedule=True,  # 是否启用阶段式 τ/σ 调度
+            enable_revive=True,  # 是否启用 revive_dead_experts
         )
 
         # 4) 运行态
@@ -201,7 +204,7 @@ class BalancedMoEMixin(nn.Module):
         if self.use_moe_balancer:
             self._feedback_from_stats(stats)
             self._schedule_and_apply(progress)
-            if revive:
+            if revive and self._moe_cfg.get("enable_revive", True):
                 self.revive_dead_experts()
         # 按一定频率打印
         pct = int(progress * 100)
@@ -322,26 +325,34 @@ class BalancedMoEMixin(nn.Module):
         """根据全局与分层反馈，更新每个 Gate 的 tau/sigma。"""
         cfg, st = self._moe_cfg, self._moe_state
         p = float(min(max(progress, 0.0), 1.0))
-        ph1, ph2 = cfg["explore_frac"], cfg["settle_frac"]
 
-        def cos_interp(x: float, a: float, b: float) -> float:
-            return b + 0.5 * (a - b) * (1 + math.cos(math.pi * x))
-
-        if p <= ph1:
-            tau, sigma = cfg["tau_hi"], cfg["sigma_hi"]
-        elif p <= ph2:
-            t = (p - ph1) / max(1e-6, (ph2 - ph1))
-            tau = cos_interp(t, cfg["tau_hi"], cfg["tau_lo"] + 0.2)
-            sigma = cos_interp(t, cfg["sigma_hi"], cfg["sigma_lo"] + 0.002)
+        # ========== (1) τ/σ 基线：可选阶段式调度 ==========
+        if not cfg.get("enable_stage_schedule", True):
+            # 消融：固定使用收敛段的 τ_lo / σ_lo，且不再用进度 p 做阶段插值
+            tau = cfg["tau_lo"]
+            sigma = cfg["sigma_lo"]
         else:
-            tau, sigma = cfg["tau_lo"], cfg["sigma_lo"]
+            # 原来的三阶段 cos 调度
+            ph1, ph2 = cfg["explore_frac"], cfg["settle_frac"]
 
-        # 全局反馈（若有）
-        ge = st["global_ema"]
-        if ge["entropy_norm"] is not None:
-            err = cfg["rho_target"] - float(ge["entropy_norm"])
-            tau += cfg["k_fb"] * err
-            sigma += 0.5 * cfg["k_fb"] * err
+            def cos_interp(x: float, a: float, b: float) -> float:
+                return b + 0.5 * (a - b) * (1 + math.cos(math.pi * x))
+
+            if p <= ph1:
+                tau, sigma = cfg["tau_hi"], cfg["sigma_hi"]
+            elif p <= ph2:
+                t = (p - ph1) / max(1e-6, (ph2 - ph1))
+                tau = cos_interp(t, cfg["tau_hi"], cfg["tau_lo"] + 0.2)
+                sigma = cos_interp(t, cfg["sigma_hi"], cfg["sigma_lo"] + 0.002)
+            else:
+                tau, sigma = cfg["tau_lo"], cfg["sigma_lo"]
+
+            # 全局反馈（若有）
+            ge = st["global_ema"]
+            if ge["entropy_norm"] is not None:
+                err = cfg["rho_target"] - float(ge["entropy_norm"])
+                tau += cfg["k_fb"] * err
+                sigma += 0.5 * cfg["k_fb"] * err
 
         # 分层反馈 + pulse
         for name, g in self._moe_gates:
@@ -419,6 +430,128 @@ class BalancedMoEMixin(nn.Module):
                 f"Hn={rec['entropy_norm']:.3f} max_share={rec['max_share']:.3f}"
             )
             print("\n".join(_bar_line(rec["usage"], width)))
+
+    # ---------------------- 外部参数注入接口 ----------------------
+    @torch.no_grad()
+    def update_clrs_config(
+        self,
+        *,
+        rho_star=None,
+        k_fb=None,
+        c_pulse=None,
+        tau_hi=None,
+        sigma_hi=None,
+        phi1=None,
+        phi2=None,
+    ):
+        """
+        从外部（LHS / 微调脚本）注入 CLRS 超参。
+        只更新传入的字段，不覆盖未传字段。
+        参数含义（论文对照）:
+          rho_star     ≡ ρ*      (目标路由熵 / 均衡程度)
+          k_fb         ≡ k_fb    (闭环反馈增益)
+          c_pulse      ≡ c_pulse (脉冲恢复强度)
+          tau_hi       ≡ τ_hi    (探索期温度上界)
+          sigma_hi     ≡ σ_hi    (探索期噪声上界)
+          phi1         ≡ φ₁      (探索阶段比例)
+          phi2         ≡ φ₂      (收敛阶段开始点)
+          lambda_aux   ≡ λ_aux   (MoE 负载均衡辅助损失权重)
+        """
+        cfg = self._moe_cfg
+
+        if rho_star is not None:
+            cfg["rho_target"] = float(rho_star)
+        if k_fb is not None:
+            cfg["k_fb"] = float(k_fb)
+        if c_pulse is not None:
+            cfg["pulse_gain"] = float(c_pulse)
+
+        # τ, σ 动态调度基线
+        if tau_hi is not None:
+            cfg["tau_hi"] = float(tau_hi)
+        if sigma_hi is not None:
+            cfg["sigma_hi"] = float(sigma_hi)
+
+        # 三阶段进度区间
+        if phi1 is not None:
+            cfg["explore_frac"] = float(phi1)
+        if phi2 is not None:
+            cfg["settle_frac"] = float(phi2)
+
+        print(f"[CLRS] Updated config:")
+        for k, v in cfg.items():
+            if k in (
+                "rho_target",
+                "k_fb",
+                "tau_hi",
+                "sigma_hi",
+                "explore_frac",
+                "settle_frac",
+                "pulse_gain",
+            ):
+                print(f"   {k} = {v}")
+        print(f"   aux_loss_weight = {self.aux_loss_weight}")
+
+    # ---------------------- 消融配置助手 ----------------------
+    @torch.no_grad()
+    def configure_clrs_ablation(
+        self,
+        *,
+        use_clrs: Optional[bool] = None,
+        disable_stage_schedule: bool = False,
+        disable_pulse: bool = False,
+        disable_revive: bool = False,
+        disable_lbl: bool = False,
+    ) -> None:
+        """
+        训练前/微调前调用，用于一键设置常用消融配置。
+
+        参数含义：
+          use_clrs:
+              - None  : 不改动（沿用当前 self.use_moe_balancer）
+              - False : 完全关闭 CLRS（仅保留普通 MoE + 可选 LBL）
+          disable_stage_schedule:
+              - True  : 关闭阶段式 τ/σ 调度（固定 τ_lo / σ_lo）
+          disable_pulse:
+              - True  : 关闭 collapse pulse（相当于 pulse_gain=0）
+          disable_revive:
+              - True  : 关闭 revive_dead_experts（不再对冷门专家加 bias）
+          disable_lbl:
+              - True  : 关闭 LBL 辅助损失（lambda_layer = lambda_global = 0）
+        """
+        # 1) CLRS 总开关
+        if use_clrs is not None:
+            self.use_moe_balancer = bool(use_clrs)
+
+        cfg = self._moe_cfg
+
+        # 2) 阶段式调度消融
+        if disable_stage_schedule:
+            cfg["enable_stage_schedule"] = False
+
+        # 3) pulse 消融
+        if disable_pulse:
+            cfg["pulse_gain"] = 0.0
+
+        # 4) revive 消融（通过全局开关控制；moe_step 已经支持）
+        if disable_revive:
+            cfg["enable_revive"] = False
+
+        # 5) LBL 消融（把权重置 0 即可）
+        if disable_lbl:
+            cfg["lambda_layer"] = 0.0
+            cfg["lambda_global"] = 0.0
+
+        # 打印当前关键配置，方便 sanity check
+        print("[CLRS Ablation] use_clrs          =", self.use_moe_balancer)
+        print(
+            "[CLRS Ablation] stage_schedule_on =",
+            cfg.get("enable_stage_schedule", True),
+        )
+        print("[CLRS Ablation] pulse_gain        =", cfg["pulse_gain"])
+        print("[CLRS Ablation] revive_enabled    =", cfg.get("enable_revive", True))
+        print("[CLRS Ablation] lambda_layer      =", cfg["lambda_layer"])
+        print("[CLRS Ablation] lambda_global     =", cfg["lambda_global"])
 
 
 if __name__ == "__main__":

@@ -33,9 +33,6 @@ import matplotlib.pyplot as plt
 # ==== 你的项目内模块 ====
 from buildings_bench.data import load_torch_dataset  # ← 统一入口
 from buildings_bench.transforms import BoxCoxTransform
-from buildings_bench.models.transformer_moes_update_20 import (
-    LoadForecastingTransformerMoE,
-)
 from buildings_bench.models.buildmoe import BuildMoE
 
 

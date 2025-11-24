@@ -30,7 +30,7 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         continuous_loads: bool = True,
         continuous_head: Literal["huber"] = "huber",
         use_dense: bool = False,
-        arch_mode: Literal["encdec", "encoder", "decoder"] = "decoder",
+        arch_mode: Literal["encdec", "encoder", "decoder"] = "encdec",
         aux_loss_weight: float = 0.01,
         n_shared_experts: int = 0,
         use_moe_balancer: bool = True,

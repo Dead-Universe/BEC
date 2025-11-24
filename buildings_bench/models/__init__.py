@@ -26,7 +26,7 @@ from buildings_bench.models.transformer_moes_update_20 import (
 from buildings_bench.models.buildmoe import BuildMoE
 from buildings_bench.models.seasonal_naive import SeasonalNaive24, SeasonalNaive168
 from buildings_bench.models.nhits import NHITSBB
-from buildings_bench.models.time_mixer import TimeMixerBB
+from buildings_bench.models.time_mixer import TimeMixerBB, LoadForecastingTimeMixer_A
 
 model_registry = {
     "TransformerWithTokenizer-L": LoadForecastingTransformer,
@@ -70,12 +70,16 @@ model_registry = {
     "BuildMoE-top-k-2-without-shared-export": BuildMoE,
     "BuildMoE-top-k-4-without-shared-export": BuildMoE,
     "BuildMoE-top-k-2-decoder-not-use-loopback": BuildMoE,
+    "BuildMoE-top-k-2-without-shared-export-expert-4": BuildMoE,
+    "BuildMoE-top-k-2-without-shared-export-expert-12": BuildMoE,
+    "BuildMoE-top-k-2-without-shared-export-expert-12-not-use-loopback": BuildMoE,
     "BuildMoE-top-k-4": BuildMoE,
     "BuildMoE-top-k-2-decoder": BuildMoE,
     "BuildMoE-dense": BuildMoE,
     "TimeSeriesTransformer-S": TimeSeriesTransformer,
     "PatchTST-S": LoadForecastingPatchTST_A,
     "PatchTST-L": LoadForecastingPatchTST_A,
+    "TimeMixer-L": LoadForecastingTimeMixer_A,
     "PatchTSTBB": PatchTSTBB,
     "TimeMoE-S": TimeMoeForecasting,
     "TimeMoE-L": TimeMoeForecasting,

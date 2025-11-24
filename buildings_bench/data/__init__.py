@@ -1,7 +1,7 @@
 from pathlib import Path
 import torch
 import tomli
-import os
+import os, re
 from buildings_bench.data.buildings900K_new import Buildings900K
 from buildings_bench.data.datasets import TorchBuildingDatasetsFromCSV
 from buildings_bench.data.datasets import TorchBuildingDatasetFromParquet
@@ -27,6 +27,9 @@ dataset_registry = [
     "lcl",
     "university",
     "cofactor",
+    "university15t",
+    "university1t",
+    "university30t",
 ]
 
 benchmark_registry = [
@@ -43,18 +46,55 @@ benchmark_registry = [
     "lcl",
     "university",
     "cofactor",
+    "university15t",
+    "university1t",
+    "university30t",
 ]
 
 
-def parse_building_years_metadata(datapath: Path, dataset_name: str):
-    with open(datapath / "metadata" / "building_years.txt", "r") as f:
-        building_years = f.readlines()
-    building_years = [building_year.strip() for building_year in building_years]
-    building_years = filter(
-        lambda building_year: dataset_name in building_year.lower(), building_years
-    )
+def parse_building_years_metadata(datapath: Path, dataset_name: str) -> List[str]:
+    """
+    - 严格匹配数据集段（大小写无关），不会把 'university' 命中 'university15t' 等。
+    - 兼容 'bdg-2:panther' 这类“主:子”数据集名：映射到 'BDG-2/Panther_clean=...'。
+    - 不把冒号当分隔符；以文件真实分隔符 '/' 来解析。
+    """
+    ds_query = dataset_name.lower().strip()
+    # 是否是“主:子”形式（例如 'bdg-2:panther'）
+    if ":" in ds_query:
+        base_ds, sub_ds = ds_query.split(":", 1)
+        sub_ds = sub_ds.strip()
+    else:
+        base_ds, sub_ds = ds_query, None
 
-    return list(building_years)
+    kept: List[str] = []
+    with open(datapath / "metadata" / "building_years.txt", "r", encoding="utf-8") as f:
+        for raw in f:
+            ln = raw.strip()
+            if not ln or "=" not in ln:
+                continue
+            path_part, _year = ln.split("=", 1)
+            parts = path_part.split("/")  # 关键：按实际使用的 '/' 分段
+            if not parts:
+                continue
+
+            first_seg = parts[
+                0
+            ].lower()  # 数据集段（如 'cofactor', 'university15t', 'bdg-2', ...)
+            if sub_ds is None:
+                # 简单数据集：首段精确等于 dataset_name
+                if first_seg == base_ds:
+                    kept.append(ln)
+            else:
+                # “主:子”数据集：首段匹配 base_ds，第二段去掉 '_clean' 后匹配 sub_ds
+                if first_seg != base_ds or len(parts) < 2:
+                    continue
+                second_seg = parts[1].lower()
+                # 去掉诸如 '_clean' 后缀以获得子类名（如 'panther_clean' -> 'panther'）
+                second_core = second_seg.split("_clean", 1)[0]
+                if second_core == sub_ds:
+                    kept.append(ln)
+
+    return kept
 
 
 def load_pretraining(
@@ -128,9 +168,9 @@ def load_pretraining(
 
 def load_torch_dataset(
     name: str,
-    dataset_path: Path = None,
+    dataset_path: Path | None = None,
     apply_scaler_transform: str = "",
-    scaler_transform_path: Path = None,
+    scaler_transform_path: Path | None = None,
     weather_inputs: List[str] | None = None,
     include_outliers: bool = False,
     context_len=168,

@@ -26,14 +26,14 @@ torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:0 \
     scripts/train_mixed.py \
-    --model BuildMoE-top-k-2 \
+    --model BuildMoE-top-k-2-without-shared-export-expert-12-not-use-loopback \
     --disable_slurm \
     --num_workers 32 \
 
 PYTHON="python -u"
 CONTEXT=168
 LOG_DIR=logs
-MODE=BuildMoE-top-k-2
+MODE=BuildMoE-top-k-2-without-shared-export-expert-12-not-use-loopback
 mkdir -p "$LOG_DIR"
 
 for H in  1 6 12 24 48 96 168; do
@@ -46,7 +46,7 @@ for H in  1 6 12 24 48 96 168; do
       --benchmark real \
       --forecast_horizon "$H" \
       --variant_name "${CONTEXT}_${H}" \
-      --checkpoint checkpoints/BuildMoE-top-k-2_best_val.pt \
+      --checkpoint checkpoints/BuildMoE-top-k-2-without-shared-export-expert-12-not-use-loopback_best_val.pt \
       --apply_scaler_transform boxcox \
       --device cuda \
       --batch_size 1024 \
