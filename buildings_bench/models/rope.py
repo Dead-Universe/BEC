@@ -71,6 +71,17 @@ class RoPEMultiheadAttention(nn.Module):
         # 关键！让 TransformerEncoder 识别 batch_first
         self.batch_first = True
 
+        self._rope_cache = {}  # type: dict[tuple[int, torch.device], torch.Tensor]
+
+    def _get_rope(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        key = (seq_len, device)
+        rope = self._rope_cache.get(key)
+        if rope is None:
+            # 与原来完全相同的计算路径，只是记住结果
+            rope = self.rope_emb(seq_len, device=device)
+            self._rope_cache[key] = rope
+        return rope
+
     # --------------------------------------------------
     # forward
     # --------------------------------------------------
@@ -101,8 +112,8 @@ class RoPEMultiheadAttention(nn.Module):
         q, k, v = [t.permute(0, 2, 1, 3) for t in (q, k, v)]
 
         # 3) RoPE 只作用于 q/k
-        q = apply_rope(q, self.rope_emb(Sq, query.device))
-        k = apply_rope(k, self.rope_emb(Sk, key.device))
+        q = apply_rope(q, self._get_rope(Sq, query.device))
+        k = apply_rope(k, self._get_rope(Sk, key.device))
 
         # 4) scaled dot‑product attention
         # attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, H, Sq, Sk]
@@ -136,17 +147,23 @@ class RoPEMultiheadAttention(nn.Module):
         # 新：
 
         # 组合 padding mask（可选）
-        attn_mask = None
+        merged_mask = attn_mask
         if key_padding_mask is not None:
-            # SDPA 支持 bool mask，形状可广播到 [B, H, Sq, Sk] 或 [B, 1, 1, Sk]
-            # 这里扩到 [B, 1, 1, Sk]
-            attn_mask = key_padding_mask[:, None, None, :]  # bool
+            pad = key_padding_mask[:, None, None, :]  # [B,1,1,Sk]
+            if merged_mask is None:
+                merged_mask = pad
+            else:
+                # 两个 mask 都存在时，做并集；bool 的话用 or，float 的话加 -inf
+                if merged_mask.dtype == torch.bool:
+                    merged_mask = merged_mask | pad
+                else:
+                    merged_mask = merged_mask + pad  # pad 需是 0 或 -inf
 
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=attn_mask,  # bool mask 或 None
+            attn_mask=merged_mask,  # bool mask 或 None
             dropout_p=self.dropout.p if self.training else 0.0,
             is_causal=is_causal,  # 让内核自己做因果掩码（无需你创建 SxS 矩阵）
         )
