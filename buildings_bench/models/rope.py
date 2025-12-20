@@ -43,6 +43,10 @@ def apply_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
 class RoPEMultiheadAttention(nn.Module):
     """
     API 与 torch.nn.MultiheadAttention 完全相同（默认 batch_first=True）
+    支持 Qwen3 风格的 Headwise Gate：
+      - use_headwise_gate=True 时：
+          q_proj 输出: [B, Sq, H * d_head + H]
+          其中额外的 H 维作为每个 head 的 gate_score
     """
 
     def __init__(
@@ -51,6 +55,7 @@ class RoPEMultiheadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         bias: bool = True,
+        use_headwise_gate: bool = False,  # ★ 新增：是否启用 headwise gate
     ):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
@@ -59,25 +64,30 @@ class RoPEMultiheadAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         self.scale = self.head_dim**-0.5
 
-        # 独立的 q / k / v 投影
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.use_headwise_gate = use_headwise_gate
+
+        # -------- q / k / v 投影 --------
+        # Qwen3 的做法：q_proj 多出 num_heads 维度，用于 gate_score
+        q_out_dim = embed_dim + (num_heads if self.use_headwise_gate else 0)
+        self.q_proj = nn.Linear(embed_dim, q_out_dim, bias=bias)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
 
         self.rope_emb = RotaryEmbedding(self.head_dim)
 
-        # 关键！让 TransformerEncoder 识别 batch_first
         self.batch_first = True
+        self._rope_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
-        self._rope_cache = {}  # type: dict[tuple[int, torch.device], torch.Tensor]
-
+    # --------------------------------------------------
+    # RoPE cache
+    # --------------------------------------------------
     def _get_rope(self, seq_len: int, device: torch.device) -> torch.Tensor:
         key = (seq_len, device)
         rope = self._rope_cache.get(key)
         if rope is None:
-            # 与原来完全相同的计算路径，只是记住结果
             rope = self.rope_emb(seq_len, device=device)
             self._rope_cache[key] = rope
         return rope
@@ -103,71 +113,74 @@ class RoPEMultiheadAttention(nn.Module):
         B, Sq, _ = query.shape
         Sk = key.shape[1]
 
-        # 1) 线性映射 → [B, S, H, d]
-        q = self.q_proj(query).view(B, Sq, self.num_heads, self.head_dim)
+        # ---------------- Q 投影 + Headwise Gate ----------------
+        # q_raw: [B, Sq, D + H] or [B, Sq, D]
+        q_raw = self.q_proj(query)
+
+        if self.use_headwise_gate:
+            # [B, Sq, H, head_dim + 1]
+            q_raw = q_raw.view(B, Sq, self.num_heads, self.head_dim + 1)
+            # 切分出真正的 q 和 gate_score
+            # q_part: [B, Sq, H, head_dim]
+            # gate_score: [B, Sq, H, 1]
+            q_part, gate_score = torch.split(
+                q_raw,
+                [self.head_dim, 1],
+                dim=-1,
+            )
+            # 变到 [B, H, Sq, d] / [B, H, Sq, 1] 以兼容后续 attention 计算
+            q = q_part.permute(0, 2, 1, 3).contiguous()  # [B,H,Sq,d]
+            gate_score = gate_score.permute(0, 2, 1, 3).contiguous()  # [B,H,Sq,1]
+        else:
+            # 原来的路径：q_proj 输出 [B,Sq,D] → [B,Sq,H,d]
+            q = q_raw.view(B, Sq, self.num_heads, self.head_dim)
+            q = q.permute(0, 2, 1, 3).contiguous()  # [B,H,Sq,d]
+            gate_score = None
+
+        # ---------------- K / V 投影 ----------------
         k = self.k_proj(key).view(B, Sk, self.num_heads, self.head_dim)
         v = self.v_proj(value).view(B, Sk, self.num_heads, self.head_dim)
 
         # 2) 交换维度 → [B, H, S, d]
-        q, k, v = [t.permute(0, 2, 1, 3) for t in (q, k, v)]
+        k = k.permute(0, 2, 1, 3).contiguous()  # [B,H,Sk,d]
+        v = v.permute(0, 2, 1, 3).contiguous()  # [B,H,Sk,d]
 
         # 3) RoPE 只作用于 q/k
         q = apply_rope(q, self._get_rope(Sq, query.device))
         k = apply_rope(k, self._get_rope(Sk, key.device))
 
-        # 4) scaled dot‑product attention
-        # attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, H, Sq, Sk]
-
-        # # padding & attn mask
-        # if attn_mask is not None:
-        #     attn = attn + attn_mask
-        # if key_padding_mask is not None:
-        #     attn = attn.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
-        # if is_causal:
-        #     causal_mask = torch.triu(
-        #         torch.full((Sq, Sk), float("-inf"), device=attn.device),
-        #         diagonal=1,
-        #     )
-        #     attn = attn + causal_mask
-
-        # attn = F.softmax(attn, dim=-1, dtype=torch.float32)
-        # attn = self.dropout(attn)
-
-        # # 5) 计算输出，reshape 回 [B, Sq, D]
-        # out = (attn @ v).transpose(1, 2).reshape(B, Sq, self.embed_dim)
-        # out = self.out_proj(out)
-
-        # if need_weights:
-        #     # 返回平均到 head 的权重，保持与官方接口一致
-        #     return out, attn.mean(dim=1)
-        # return out, None
-
-        # 替换 4) 开始的整个 attention 计算段
-        # 原: attn = (q @ k.transpose(-2, -1)) * self.scale; ... softmax/dropout; out = (attn @ v) ...
-        # 新：
-
-        # 组合 padding mask（可选）
+        # 4) 组合 mask，走 F.scaled_dot_product_attention
         merged_mask = attn_mask
         if key_padding_mask is not None:
+            # key_padding_mask: [B, Sk] (True 为 mask 或 0/1 视实现而定)
             pad = key_padding_mask[:, None, None, :]  # [B,1,1,Sk]
             if merged_mask is None:
                 merged_mask = pad
             else:
-                # 两个 mask 都存在时，做并集；bool 的话用 or，float 的话加 -inf
                 if merged_mask.dtype == torch.bool:
                     merged_mask = merged_mask | pad
                 else:
-                    merged_mask = merged_mask + pad  # pad 需是 0 或 -inf
+                    merged_mask = merged_mask + pad  # 0 / -inf 叠加
 
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=merged_mask,  # bool mask 或 None
+        attn_out = F.scaled_dot_product_attention(
+            q,  # [B,H,Sq,d]
+            k,  # [B,H,Sk,d]
+            v,  # [B,H,Sk,d]
+            attn_mask=merged_mask,  # [B,1,Sq,Sk] 或 None
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=is_causal,  # 让内核自己做因果掩码（无需你创建 SxS 矩阵）
-        )
-        # out: [B, H, Sq, d]
-        out = out.transpose(1, 2).reshape(B, Sq, self.embed_dim)
+            is_causal=is_causal,
+        )  # [B,H,Sq,d]
+
+        # 5) ★ Headwise Gate：对每个 head 的输出加一个 sigmoid gate
+        if gate_score is not None:
+            # gate_score: [B,H,Sq,1] → broadcast 到 d 的维度
+            attn_out = attn_out * torch.sigmoid(gate_score)
+
+        # 6) heads 合并回 [B, Sq, D]
+        out = attn_out.transpose(1, 2).reshape(B, Sq, self.embed_dim)
         out = self.out_proj(out)
+
+        if need_weights:
+            # 这里没显式保留 attn 权重，只能返回 None 或者后续你想补的话再改
+            return out, None
         return out, None
