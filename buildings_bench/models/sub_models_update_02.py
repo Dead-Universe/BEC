@@ -1,3 +1,4 @@
+from __future__ import annotations
 import math
 from typing import List, Literal, Optional, Tuple, Union
 
@@ -141,6 +142,8 @@ class ModelArgs(PyBaseModel):
     pred_len: int = 24
     use_dense: bool = False
     arch_mode: Literal["encdec", "encoder", "decoder"] = "encdec"
+    use_headwise_gate: bool = False
+    use_elementwise_gate: bool = False
 
     model_config = ConfigDict(
         extra="ignore",  # 多余键直接忽略；改成 "forbid" 可强制报错
@@ -400,26 +403,7 @@ class Expert(MLP):
 
 
 class MoE(nn.Module):
-    """
-    Mixture-of-Experts (MoE) module.
-
-    Attributes:
-        dim (int): Dimensionality of input features.
-        n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
-        n_activated_experts (int): Number of experts activated for each input.
-        gate (nn.Module): Gating mechanism to route inputs to experts.
-        experts (nn.ModuleList): List of expert modules.
-        shared_experts (nn.Module): Shared experts applied to all inputs.
-    """
-
     def __init__(self, args: ModelArgs):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
         super().__init__()
         self.dim = args.dim
         self.n_routed_experts = args.n_routed_experts
@@ -433,26 +417,61 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
+        更高效的 MoE 前向：
+        - 显存：不构建 [T*k, D]，只多了若干 [T*k] 的一维辅助张量（极小）
+        - 速度：避免对 indices 做 E 次全表扫描
         """
-        shape = x.size()
-        x = x.reshape(-1, self.dim)
-        weights, indices = self.gate(x)
-        y = torch.zeros_like(x)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
-        for i in range(self.n_routed_experts):
-            if counts[i] == 0:
-                continue
-            idx, top = torch.where(indices == i)
-            expert = self.experts[i]
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
-        z = self.shared_experts(x)
+        shape = x.size()  # [B, ..., D]
+        x = x.reshape(-1, self.dim)  # [T, D]
+        T, D = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # gate: 每个 token 选 k 个 expert
+        weights, indices = self.gate(x)  # [T, k], [T, k]
+        T, k = indices.shape
+        E = self.n_routed_experts
+
+        # 累积输出
+        y = torch.zeros(T, D, device=device, dtype=dtype)
+
+        # ------- 关键：一次性 flatten，避免 E 次 where(indices == i) --------
+        indices_flat = indices.reshape(-1)  # [T*k]
+        weights_flat = weights.reshape(-1)  # [T*k]
+        # token_id_flat[t*k + s] = t
+        token_id_flat = (
+            torch.arange(T, device=device).unsqueeze(1).expand(T, k).reshape(-1)
+        )
+
+        # 按 expert id 排序，把同一 expert 的 (token,slot) 挤在一起
+        sorted_exp, order = torch.sort(indices_flat)  # [T*k]
+        sorted_tokens = token_id_flat[order]  # [T*k]
+        sorted_w = weights_flat[order]  # [T*k]
+
+        # searchsorted 找出每个 expert 在 sorted_exp 中的段 [start, end)
+        boundaries = torch.searchsorted(
+            sorted_exp, torch.arange(E + 1, device=device, dtype=sorted_exp.dtype)
+        )  # [E+1]
+
+        # ------- 逐 expert 处理自己这一段，显存只保留 x_e / out_e 子集 --------
+        for e in range(E):
+            start = int(boundaries[e].item())
+            end = int(boundaries[e + 1].item())
+            if start == end:
+                continue  # 这个 expert 没有 token
+
+            token_ids_e = sorted_tokens[start:end]  # [N_e]
+            w_e = sorted_w[start:end].unsqueeze(1)  # [N_e, 1]
+
+            x_e = x[token_ids_e]  # [N_e, D]
+            out_e = self.experts[e](x_e)  # [N_e, D]
+
+            # 累加回对应 token
+            y.index_add_(0, token_ids_e, out_e * w_e)
+
+        # 共享 expert：对所有 token 作用一遍
+        z = self.shared_experts(x)  # [T, D]
+
         return (y + z).reshape(shape)
 
 
@@ -540,7 +559,11 @@ class Decoder(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(args.dim)
         self.self_attn = RoPEMultiheadAttention(
-            embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
+            embed_dim=args.dim,
+            num_heads=args.n_heads,
+            dropout=0.0,
+            use_headwise_gate=args.use_headwise_gate,
+            use_elementwise_gate=args.use_elementwise_gate,
         )
         self.ffn = (
             MLP(args.dim, args.inter_dim)
@@ -552,10 +575,14 @@ class Decoder(nn.Module):
                 args.dim,
                 (args.n_activated_experts + args.n_shared_experts) * args.moe_inter_dim,
             )
-        self.norm2 = RMSNorm(args.dim)
         if args.arch_mode == "encdec":
+            self.norm2 = RMSNorm(args.dim)
             self.multihead_attn = RoPEMultiheadAttention(
-                embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
+                embed_dim=args.dim,
+                num_heads=args.n_heads,
+                dropout=0.0,
+                use_headwise_gate=args.use_headwise_gate,
+                use_elementwise_gate=args.use_elementwise_gate,
             )
         self.ffn_norm = RMSNorm(args.dim)
         self.ans_norm = RMSNorm(args.dim)
@@ -614,7 +641,8 @@ class Decoder(nn.Module):
             )
             z = y + cross_out
         else:
-            z = self.norm2(y)  # 与 enc-dec 情况保持相近的归一化路径
+            # z = self.norm2(y)  # 与 enc-dec 情况保持相近的归一化路径
+            z = y
 
         out = z + self.ffn(self.ffn_norm(z))
         return self.ans_norm(out)  # [B, S_tgt, D] 输出
