@@ -21,7 +21,7 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         context_len: int = 168,
         pred_len: int = 24,
         num_encoder_layers: int = 8,
-        num_decoder_layers: int = 22,
+        num_decoder_layers: int = 10,
         d_model: int = 768,
         nhead: int = 12,
         dim_feedforward: int = 2048,
@@ -35,6 +35,8 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         n_shared_experts: int = 0,
         use_moe_balancer: bool = True,
         use_moe_loss: bool = True,
+        use_headwise_gate: bool = False,
+        use_elementwise_gate: bool = False,
         **kwargs,
     ):
         super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
@@ -66,6 +68,8 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
             route_scale=1.0,
             use_dense=use_dense,
             arch_mode=arch_mode,
+            use_headwise_gate=use_headwise_gate,
+            use_elementwise_gate=use_elementwise_gate,
         )
 
         if self.arch_mode == "encoder" or self.arch_mode == "encdec":
@@ -76,6 +80,10 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         if self.arch_mode == "decoder" or self.arch_mode == "encdec":
             dec_layer = Decoder(self.cfg.n_dense_layers, self.cfg)
             self.decoder = nn.TransformerDecoder(dec_layer, num_decoder_layers)
+
+        self.learned_queries = nn.Parameter(
+            torch.randn(max_pred_len, d_model) * 0.02  # 小随机初始化
+        )
 
         out_dim = 1 if continuous_head in ("mse", "huber") else 2
         self.head = nn.Linear(self.cfg.dim, out_dim)
@@ -123,17 +131,27 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
             return self.head(out)[:, :pred_len, :]
 
         else:  # self.arch_mode == "decoder"
-            zeros_pred = torch.zeros(
-                B, self.max_pred_len, 1, device=load.device, dtype=load.dtype
+            ctx_embed = self.embedding(ctx)  # [B, context_len, D]
+
+            # 固定 max_pred_len 的可学习 future tokens（占位），后续再截取 pred_len
+            future = self.learned_queries  # [max_pred_len, D]
+            future = future.unsqueeze(0).expand(B, -1, -1)  # [B, max_pred_len, D]
+
+            # 拼接成完整序列：past + future_tokens
+            inp = torch.cat(
+                [ctx_embed, future], dim=1
+            )  # [B, context_len+max_pred_len, D]
+
+            # 解码器：可学习查询作为tgt，历史嵌入作为memory
+            h = self.decoder(
+                tgt=inp,  # [B, pred_len, D] - 可学习查询
+                memory=None,
+                tgt_is_causal=True,  # 预测位置之间使用因果掩码
             )
-            tgt_vals = torch.cat([ctx, zeros_pred], dim=1)  # [B, ctx+pred, 1]
 
-            tgt = self.embedding(tgt_vals)  # [B, ctx+pred, D]
-            # 关键：启用因果掩码，保证预测段位置只看见上下文与自己左边的预测占位
-            h = self.decoder(tgt, memory=None, tgt_is_causal=True)
-
-            out = h[:, -self.max_pred_len :, :]  # 仅取预测段
-            return self.head(out)[:, :pred_len, :]  # [B, pred, out_dim]
+            pred_h = h[:, -self.max_pred_len :, :]  # [B, max_pred_len, D]
+            y_hat = self.head(pred_h)  # [B, max_pred_len, out_dim]
+            return y_hat[:, :pred_len, :]
 
     # --------------------- loss（已移除分解正则） ---------------------
     def loss(
