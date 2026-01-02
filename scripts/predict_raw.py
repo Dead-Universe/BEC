@@ -25,6 +25,10 @@ except ModuleNotFoundError:
     import tomli
 import importlib.resources as ir
 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+
 # =========================
 #  Cofactor 子集映射
 # =========================
@@ -114,7 +118,7 @@ def main():
 
     baseline_model = {
         "name": "BuildMoE-top-k-2",
-        "ckpt": "/home/hadoop/bec/BuildingsBench/checkpoints/BuildMoE-top-k-2_best_val.pt",
+        "ckpt": "/home/hadoop/bec/BuildingsBench/checkpoints/BuildMoE-top-k-2-without-shared-export_best_val.pt",
     }
     other_models = [
         {
