@@ -24,6 +24,10 @@ from buildings_bench.data import load_torch_dataset
 from buildings_bench.models import model_factory
 from buildings_bench.transforms import BoxCoxTransform
 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+
 benchmark_registry: List[str] = [
     "buildings-900k-test",
     "sceaux",
