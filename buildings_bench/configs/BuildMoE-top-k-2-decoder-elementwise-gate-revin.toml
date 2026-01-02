@@ -16,6 +16,8 @@ num_experts = 8
 top_k = 2
 arch_mode = 'decoder'
 n_shared_experts = 0
+use_elementwise_gate = true
+use_revin = true
 
 [pretrain]
 batch_size = 16
@@ -23,7 +25,7 @@ init_scale = 0.02
 warmup_steps = 20000
 lr = 0.00006
 train_tokens = 2000000000
-eval_every = 200
+eval_every = 5
 apply_scaler_transform = 'boxcox'
 note = ''
 

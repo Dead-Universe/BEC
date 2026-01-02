@@ -18,7 +18,7 @@ arch_mode = 'decoder'
 n_shared_experts = 0
 
 [pretrain]
-batch_size = 16
+batch_size = 32
 init_scale = 0.02
 warmup_steps = 20000
 lr = 0.00006

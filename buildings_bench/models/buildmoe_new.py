@@ -12,44 +12,7 @@ from buildings_bench.models.sub_models_update_02 import (
 from torch import nn
 
 
-class RevIN(nn.Module):
-    """
-    Reversible Instance Normalization for time series.
-    - 只做 per-sample 的 (x - mu) / std
-    - mu/std 必须来自 context (避免泄漏)
-    """
-
-    def __init__(self, num_features: int = 1, eps: float = 1e-5, affine: bool = False):
-        super().__init__()
-        self.eps = eps
-        self.affine = affine
-        if affine:
-            self.gamma = nn.Parameter(torch.ones(1, 1, num_features))
-            self.beta = nn.Parameter(torch.zeros(1, 1, num_features))
-
-    @torch.no_grad()
-    def _get_stats(self, x_ctx: torch.Tensor):
-        # x_ctx: [B, T_ctx, C]
-        mu = x_ctx.mean(dim=1, keepdim=True)  # [B,1,C]
-        var = x_ctx.var(dim=1, keepdim=True, unbiased=False)  # [B,1,C]
-        std = torch.sqrt(var + self.eps)  # [B,1,C]
-        return mu, std
-
-    def norm(self, x: torch.Tensor, mu: torch.Tensor, std: torch.Tensor):
-        # x: [B,T,C]
-        x = (x - mu) / std
-        if self.affine:
-            x = x * self.gamma + self.beta
-        return x
-
-    def denorm(self, x: torch.Tensor, mu: torch.Tensor, std: torch.Tensor):
-        if self.affine:
-            x = (x - self.beta) / (self.gamma + 1e-12)
-        x = x * std + mu
-        return x
-
-
-class BuildMoE(BaseModel, BalancedMoEMixin):
+class NewBuildMoE(BaseModel, BalancedMoEMixin):
 
     def __init__(
         self,
@@ -58,7 +21,7 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         context_len: int = 168,
         pred_len: int = 24,
         num_encoder_layers: int = 8,
-        num_decoder_layers: int = 10,
+        num_decoder_layers: int = 22,
         d_model: int = 768,
         nhead: int = 12,
         dim_feedforward: int = 2048,
@@ -72,11 +35,6 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         n_shared_experts: int = 0,
         use_moe_balancer: bool = True,
         use_moe_loss: bool = True,
-        use_headwise_gate: bool = False,
-        use_elementwise_gate: bool = False,
-        use_revin: bool = False,
-        revin_affine: bool = False,
-        revin_eps: float = 1e-5,
         **kwargs,
     ):
         super().__init__(context_len, pred_len, continuous_loads=continuous_loads)
@@ -87,13 +45,6 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
         self.use_dense = use_dense
         self.aux_loss_weight = aux_loss_weight
         self.use_moe_loss = use_moe_loss
-
-        self.use_revin = use_revin
-        self.revin = (
-            RevIN(num_features=1, eps=revin_eps, affine=revin_affine)
-            if use_revin
-            else None
-        )
 
         # ------- 三路编码/解码（结构保持不变） -------
         self.embedding = nn.Linear(1, d_model)
@@ -115,8 +66,6 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
             route_scale=1.0,
             use_dense=use_dense,
             arch_mode=arch_mode,
-            use_headwise_gate=use_headwise_gate,
-            use_elementwise_gate=use_elementwise_gate,
         )
 
         if self.arch_mode == "encoder" or self.arch_mode == "encdec":
@@ -128,247 +77,83 @@ class BuildMoE(BaseModel, BalancedMoEMixin):
             dec_layer = Decoder(self.cfg.n_dense_layers, self.cfg)
             self.decoder = nn.TransformerDecoder(dec_layer, num_decoder_layers)
 
-        # self.learned_queries = nn.Parameter(
-        #     torch.randn(max_pred_len, d_model) * 0.02  # 小随机初始化
-        # )
-        # =========================
-        # Decoder-only: latent-attention query generator
-        # =========================
-        self.num_query_experts = num_experts
-        self.query_top_k = None
-
-        # 每个专家一套 query 模板: [E, max_pred_len, D]
-        self.query_experts = nn.Parameter(
-            torch.randn(self.num_query_experts, max_pred_len, d_model) * 0.02
+        out_dim = (
+            max_pred_len
+            if continuous_head in ("mse", "huber")
+            else max_pred_len * 2  # 如果以后要高斯头，可以这么设计
         )
-
-        # step embedding：位置 + pred_len embedding
-        self.query_pos = nn.Parameter(torch.randn(max_pred_len, d_model) * 0.02)
-        self.pred_len_emb = nn.Embedding(max_pred_len + 1, d_model)
-
-        # ----- latent tokens（很少，比如 8）-----
-        self.num_latents = 8
-        self.latents = nn.Parameter(torch.randn(self.num_latents, d_model) * 0.02)
-
-        # ----- stage1: latents attend to full ctx -----
-        self.lat_q = nn.Linear(d_model, d_model, bias=False)
-        self.ctx_k = nn.Linear(d_model, d_model, bias=False)
-        self.ctx_v = nn.Linear(d_model, d_model, bias=False)
-        self.lat_out = nn.Linear(d_model, d_model, bias=False)
-
-        # ----- stage2: step tokens attend to conditioned latents -----
-        self.step_q = nn.Linear(d_model, d_model, bias=False)
-        self.lat_k = nn.Linear(d_model, d_model, bias=False)
-        self.lat_v = nn.Linear(d_model, d_model, bias=False)
-        self.step_out = nn.Linear(d_model, d_model, bias=False)
-
-        # gate：输入用 [step_base, step_ctx] 拼起来（信息更足）
-        self.query_gate_mlp = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, self.num_query_experts),
-        )
-
-        out_dim = 1 if continuous_head in ("mse", "huber") else 2
         self.head = nn.Linear(self.cfg.dim, out_dim)
+
+        # 额外加一个 decoder 起始 token（只在 encdec / decoder 模式用）
+        self.dec_start = nn.Parameter(
+            torch.zeros(1, 1, self.cfg.dim)
+        )  # 你也可以改成正态初始化
 
         self._init_balancer(use_moe_balancer)
 
-    def _sdpa_1head(
-        self,
-        q: torch.Tensor,  # [B, Q, D]
-        k: torch.Tensor,  # [B, K, D]
-        v: torch.Tensor,  # [B, K, D]
-    ) -> torch.Tensor:
-        """single-head scaled dot-product attention (batch_first)"""
-        D = q.size(-1)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / (D**0.5)  # [B,Q,K]
-        attn = torch.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)  # [B,Q,D]
-        return out
-
-    def _build_decoder_queries_latent(
-        self,
-        ctx_embed: torch.Tensor,  # [B, ctx, D]
-        pred_len: int,
-    ) -> torch.Tensor:
-        """
-        1) latents cross-attend full ctx -> lat_ctx: [B,M,D]
-        2) step tokens attend lat_ctx -> step_ctx: [B,pred,D]
-        3) gate(step_base, step_ctx) -> weights over query experts
-        4) sum experts -> queries: [B,pred,D]
-        """
-        B, T, D = ctx_embed.shape
-        device, dtype = ctx_embed.device, ctx_embed.dtype
-
-        # ----- step base embedding (pos + pred_len embedding) -----
-        pos = (
-            self.query_pos[:pred_len].unsqueeze(0).to(device=device, dtype=dtype)
-        )  # [1,pred,D]
-        len_vec = self.pred_len_emb(torch.tensor([pred_len], device=device)).to(
-            dtype=dtype
-        )  # [1,D]
-        len_vec = len_vec.unsqueeze(1).expand(B, pred_len, D)  # [B,pred,D]
-        step_base = pos.expand(B, pred_len, D) + len_vec  # [B,pred,D]
-
-        # =========================
-        # Stage 1: latents attend full ctx
-        # =========================
-        lat = (
-            self.latents.unsqueeze(0).expand(B, -1, -1).to(device=device, dtype=dtype)
-        )  # [B,M,D]
-        q1 = self.lat_q(lat)  # [B,M,D]
-        k1 = self.ctx_k(ctx_embed)  # [B,T,D]
-        v1 = self.ctx_v(ctx_embed)  # [B,T,D]
-        lat_ctx = self._sdpa_1head(q1, k1, v1)  # [B,M,D]
-        lat_ctx = self.lat_out(lat_ctx)  # [B,M,D]
-
-        # =========================
-        # Stage 2: per-step tokens attend lat_ctx (M is tiny)
-        # =========================
-        q2 = self.step_q(step_base)  # [B,pred,D]
-        k2 = self.lat_k(lat_ctx)  # [B,M,D]
-        v2 = self.lat_v(lat_ctx)  # [B,M,D]
-        step_ctx = self._sdpa_1head(q2, k2, v2)  # [B,pred,D]
-        step_ctx = self.step_out(step_ctx)  # [B,pred,D]
-
-        # gate logits: [B,pred,E]
-        gate_inp = torch.cat([step_base, step_ctx], dim=-1)  # [B,pred,2D]
-        logits = self.query_gate_mlp(gate_inp)  # [B,pred,E]
-
-        # top-k gating（稀疏选择专家）
-        if (
-            self.query_top_k is not None
-            and 0 < self.query_top_k < self.num_query_experts
-        ):
-            topv, topi = torch.topk(logits, k=self.query_top_k, dim=-1)  # [B,pred,k]
-            masked = torch.full_like(logits, float("-inf"))
-            masked.scatter_(-1, topi, topv)
-            weights = torch.softmax(masked, dim=-1)  # [B,pred,E]
-        else:
-            weights = torch.softmax(logits, dim=-1)
-
-        # experts queries: [E,pred,D] -> [1,pred,E,D]
-        exp_q = self.query_experts[:, :pred_len, :].to(
-            device=device, dtype=dtype
-        )  # [E,pred,D]
-        exp_q = exp_q.permute(1, 0, 2).unsqueeze(0)  # [1,pred,E,D]
-
-        # weighted sum -> [B,pred,D]
-        queries = (weights.unsqueeze(-1) * exp_q).sum(dim=2)
-        return queries
-
     # --------------------- forward ----------------------
+
     def forward(
         self,
         x: Dict[str, torch.Tensor],
         context_len: Optional[int] = None,
         pred_len: Optional[int] = None,
-    ):
+    ) -> torch.Tensor:
         if context_len is None:
             context_len = self.max_context_len
         if pred_len is None:
             pred_len = self.max_pred_len
 
-        load = x["load"]  # (B, ctx+pred, 1) 你当前尺度（Box-Cox）
-        assert load.size(1) == context_len + pred_len, "load 长度与 ctx+pred 不一致"
-        B, _, _ = load.shape
+        load = x["load"]  # (B, ctx+pred, 1)，与 stl_* 同尺度（Box-Cox）
+        assert load.size(1) >= context_len, "load 长度必须至少包含 context_len"
+
+        B = load.size(0)
         ctx = load[:, :context_len]  # [B, ctx, 1]
 
-        # =========================
-        # RevIN: stats ONLY from ctx (no leakage)
-        # =========================
-        if self.use_revin and self.revin is not None:
-            mu, std = self.revin._get_stats(ctx)  # [B,1,1], [B,1,1]
-            ctx_in = self.revin.norm(ctx, mu, std)  # [B,ctx,1]
-        else:
-            mu, std = None, None
-            ctx_in = ctx
-
+        # ------------ 三种架构分别得到一个全局表示 last_h: [B, D] ------------
         if self.arch_mode == "encdec":
-            # ===== Encoder-Decoder =====
-            mem = self.encoder(self.embedding(ctx_in))
+            # 1) 编码器：只在 context 上跑（不变）
+            mem = self.encoder(self.embedding(ctx))  # [B, ctx, D]
 
-            query = torch.zeros(
-                B, self.max_pred_len, self.cfg.dim, device=load.device, dtype=load.dtype
+            # 2) Decoder：只用 1 个 start token，而不是 max_pred_len 个 query
+            #    dec_start: [1, 1, D] -> [B, 1, D]
+            query = self.dec_start.expand(B, 1, self.cfg.dim).to(
+                device=load.device, dtype=load.dtype
             )
-            out = self.decoder(query, mem)
-            y_hat = self.head(out)  # [B,max_pred_len,1 or 2]
 
-            y_hat = y_hat[:, :pred_len, :]
-
-            # inverse RevIN back to original (Box-Cox) scale for loss/metrics compatibility
-            if (
-                self.use_revin
-                and self.revin is not None
-                and mu is not None
-                and std is not None
-            ):
-                # 只还原数值通道：continuous_head=1 你这里是 1 维
-                y_hat = self.revin.denorm(y_hat, mu, std)
-
-            return y_hat
+            # 仍然允许 decoder 看到 encoder 的所有 mem
+            out = self.decoder(query, mem)  # [B, 1, D]
+            last_h = out[:, 0, :]  # [B, D]
 
         elif self.arch_mode == "encoder":
-            # ===== pure Encoder =====
-            # 关键：future placeholder 不要用 0，否则 norm 后会变成 (0-mu)/std 的怪分布
-            if (
-                self.use_revin
-                and self.revin is not None
-                and mu is not None
-                and std is not None
-            ):
-                # 用 mu 占位 → norm 后 future token == 0
-                future_raw = mu.expand(B, self.max_pred_len, 1)  # [B,pred,1]
-                future_in = self.revin.norm(future_raw, mu, std)  # == 0
-            else:
-                future_in = torch.zeros(
-                    B, self.max_pred_len, 1, device=load.device, dtype=load.dtype
-                )
-
-            inp = torch.cat([ctx_in, future_in], dim=1)  # [B, ctx+pred, 1]
-            h = self.encoder(self.embedding(inp), is_causal=True)
-            out = h[:, -self.max_pred_len :, :]
-            y_hat = self.head(out)[:, :pred_len, :]
-
-            if (
-                self.use_revin
-                and self.revin is not None
-                and mu is not None
-                and std is not None
-            ):
-                y_hat = self.revin.denorm(y_hat, mu, std)
-
-            return y_hat
+            # 纯 encoder：只在 context 上跑，最后一个 token 的 hidden 作为 summary
+            h = self.encoder(
+                self.embedding(ctx),
+                is_causal=True,  # 保持跟你原来 encoder-only 一致的“因果”设定
+            )  # [B, ctx, D]
+            last_h = h[:, -1, :]  # [B, D]
 
         else:  # self.arch_mode == "decoder"
-            ctx_embed = self.embedding(ctx_in)  # [B, context_len, D]
-
-            # ✅ 关键：动态生成 pred_len 长度的智能 queries
-            query = self._build_decoder_queries_latent(
-                ctx_embed, pred_len=pred_len
-            )  # [B,pred,D]
-
-            inp = torch.cat([ctx_embed, query], dim=1)  # [B, ctx+pred, D]
-
+            # 纯 decoder：把 context 当成一个自回归序列，最后一个位置的 hidden 作为 summary
+            tgt = self.embedding(ctx)  # [B, ctx, D]
             h = self.decoder(
-                tgt=inp,
+                tgt,
                 memory=None,
-                tgt_is_causal=True,
-            )
+                tgt_is_causal=True,  # 保持原来的因果设定
+            )  # [B, ctx, D]
+            last_h = h[:, -1, :]  # [B, D]
 
-            pred_h = h[:, -pred_len:, :]  # ✅ 直接取 pred_len
-            y_hat = self.head(pred_h)  # [B,pred,1 or 2]
+        # ------------ 通用多步 head：一次性输出 max_pred_len 步 ------------
+        head_out = self.head(last_h)  # [B, max_pred_len] 或 [B, max_pred_len * C]
+        head_out = head_out.view(B, self.max_pred_len, -1)  # [B, max_pred_len, C]
 
-            if (
-                self.use_revin
-                and self.revin is not None
-                and mu is not None
-                and std is not None
-            ):
-                y_hat = self.revin.denorm(y_hat, mu, std)
-
-            return y_hat
+        # 只取前 pred_len 步，形状保持 [B, pred_len, 1] / [B, pred_len, C]
+        if self.continuous_head in ("mse", "huber"):
+            # C = 1
+            return head_out[:, :pred_len, :]
+        else:
+            # 比如以后你搞 gaussian_nll: C = 2 (mu, logvar)
+            return head_out[:, :pred_len, :]
 
     # --------------------- loss（已移除分解正则） ---------------------
     def loss(
@@ -655,13 +440,15 @@ def moe_static_params(model: torch.nn.Module):
 # ======================= Quick self-test =======================
 if __name__ == "__main__":
     import torch
+    import time
 
     # 固定随机种子，方便复现
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ==== 初始化模型 ====
-    model = BuildMoE(arch_mode="decoder").to(device)
+    model = BuildMoE().to(device)
+    model.train()  # 计时一般按训练模式来
 
     # ==== 统计 MoE 参数量 ====
     stats = moe_static_params(model)
@@ -669,21 +456,54 @@ if __name__ == "__main__":
         print(f"{k}: {v}")
 
     # ==== 伪造输入数据 ====
-    B = 4
-    ctx, pred = 96, 24
+    B = 32
+    ctx, pred = 168, 168
     load = torch.randn(B, ctx + pred, 1, device=device)  # (B, 120, 1)
     sample = {"load": load}
     target = load[:, -pred:]  # 预测的 ground truth
 
-    # ==== 前向推理 ====
+    # ==== 简单的优化器（为了 zero_grad，真实训练时换成你自己的）====
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    # ==== 单次前向 + 损失 + 反向，检查一下 ====
+    progress = 0.1  # 模拟训练进度 (10%)
     out = model(sample, context_len=ctx, pred_len=pred)  # (B, pred, 1)
     print("Forward out:", out.shape)
 
-    # ==== 损失函数 ====
-    progress = 0.1  # 模拟训练进度 (10%)
     loss = model.loss(out, target, progress=progress)
     print("Loss (with aux):", float(loss))
 
-    # ==== 反向传播 ====
     loss.backward()
     print("Backward pass OK")
+
+    optimizer.zero_grad(set_to_none=True)
+
+    # ================== 正式计时 ==================
+    n_warmup = 10  # 热身次数（让 cudnn/kernel 等稳定下来）
+    n_iters = 50  # 实际计时迭代数
+
+    # ---- warmup ----
+    for _ in range(n_warmup):
+        out = model(sample, context_len=ctx, pred_len=pred)
+        loss = model.loss(out, target, progress=progress)
+        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    # ---- 正式计时：forward + loss + backward ----
+    for _ in range(n_iters):
+        out = model(sample, context_len=ctx, pred_len=pred)
+        loss = model.loss(out, target, progress=progress)
+        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    total_time = t1 - t0
+    print(f"\nTotal time for {n_iters} iters: {total_time:.4f} s")
+    print(f"Avg time per iter (fwd+loss+bwd): {total_time / n_iters:.6f} s")

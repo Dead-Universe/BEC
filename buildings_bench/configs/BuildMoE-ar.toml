@@ -16,6 +16,8 @@ num_experts = 8
 top_k = 2
 arch_mode = 'decoder'
 n_shared_experts = 0
+use_elementwise_gate = true
+horizon_lengths = [1, 6, 12, 24, 48, 96, 168]
 
 [pretrain]
 batch_size = 16

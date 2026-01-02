@@ -16,6 +16,7 @@ num_experts = 8
 top_k = 2
 arch_mode = 'decoder'
 n_shared_experts = 0
+use_headwise_gate = true
 
 [pretrain]
 batch_size = 16
