@@ -342,8 +342,8 @@ class BalancedMoEMixin(nn.Module):
                 tau, sigma = cfg["tau_hi"], cfg["sigma_hi"]
             elif p <= ph2:
                 t = (p - ph1) / max(1e-6, (ph2 - ph1))
-                tau = cos_interp(t, cfg["tau_hi"], cfg["tau_lo"] + 0.2)
-                sigma = cos_interp(t, cfg["sigma_hi"], cfg["sigma_lo"] + 0.002)
+                tau = cos_interp(t, cfg["tau_hi"], cfg["tau_lo"])
+                sigma = cos_interp(t, cfg["sigma_hi"], cfg["sigma_lo"])
             else:
                 tau, sigma = cfg["tau_lo"], cfg["sigma_lo"]
 
