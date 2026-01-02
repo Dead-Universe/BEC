@@ -313,8 +313,8 @@ def evaluate_all(model, loaders_dict, transform, inverse, device):
             se += (err**2).sum().item()
             ae += err.abs().sum().item()
             n += err.numel()
-            if i >= 100:
-                break
+            # if i >= 100:
+            #     break
         out[(c, p)] = (math.sqrt(se / n), ae / n)
 
     model.train()
@@ -404,7 +404,7 @@ def main(args, model_args):
         context_len=model_args["max_context_len"],
         pred_len=model_args["max_pred_len"],
         apply_scaler_transform=args.apply_scaler_transform,
-        # split="val",
+        split="train",
         # oov_val=Path("./oov_val.txt"),
         # oov_test=Path("./oov_test.txt"),
     )
@@ -497,6 +497,14 @@ def main(args, model_args):
     best_val_rmse = float("inf")
     tokens_buf = seen_tokens = update_idx = 0
 
+    if args.from_checkpoint:
+        ckpt_path = checkpoint_dir / args.from_checkpoint
+        if not ckpt_path.exists():
+            raise FileNotFoundError(ckpt_path)
+        checkpoint = torch.load(ckpt_path, map_location=f"cuda:{local_rank}")
+        model.load_state_dict(checkpoint["model"], strict=False)
+        print("Success load from checkpoint")
+
     if args.resume_from_checkpoint:
         ckpt_path = checkpoint_dir / args.resume_from_checkpoint
         if not ckpt_path.exists():
@@ -547,7 +555,6 @@ def main(args, model_args):
                 loss = model.module.loss(preds, tgt, progress=progress)
             except Exception as e:
                 loss = loss_fn(preds, tgt)
-                continue
 
         scaler.scale(loss).backward()
 
@@ -594,10 +601,30 @@ def main(args, model_args):
                             f"[rank 0] Eval@upd{update_idx}  "
                             f"(ctx{c},pred{p})  RMSE={rmse:.4f}  MAE={mae:.4f}"
                         )
-                    # 用最长 horizon 336→168 做早停/最佳模型
-                    main_rmse = metrics[(336, 168)][0]
-                    if main_rmse < best_val_rmse - 1e-9:
-                        best_val_rmse = main_rmse
+
+                    # 计算四种长度的 RMSE 均值作为主要指标
+                    rmse_values = []
+
+                    for combo in VAL_COMBOS:
+                        if combo in metrics:
+                            rmse_values.append(metrics[combo][0])
+                        else:
+                            print(f"警告: 组合 {combo} 不在 metrics 中")
+                            # 如果某个组合缺失，可以用0或其他默认值，但最好确保它存在
+                            rmse_values.append(0.0)
+
+                    # 计算平均值（只计算存在的值）
+                    valid_rmse_values = [rmse for rmse in rmse_values if rmse > 0]
+                    if valid_rmse_values:
+                        avg_rmse = sum(valid_rmse_values) / len(valid_rmse_values)
+                    else:
+                        avg_rmse = float("inf")  # 如果没有有效的RMSE值，设为无穷大
+
+                    print(f"[rank 0] 四种组合平均RMSE: {avg_rmse:.4f}")
+
+                    # 用平均 RMSE 作为最佳模型判断标准
+                    if avg_rmse < best_val_rmse - 1e-9:
+                        best_val_rmse = avg_rmse
                         utils.save_model_checkpoint(
                             model,
                             optimizer,
@@ -606,6 +633,7 @@ def main(args, model_args):
                             best_val_rmse,
                             checkpoint_dir / f"{ckpt_name}_best_val.pt",
                         )
+                        print(f"[rank 0] 保存最佳模型，平均RMSE: {best_val_rmse:.4f}")
                 if args.world_size > 1:
                     # 等待 rank 0 完成验证
                     torch.distributed.barrier()
@@ -716,6 +744,12 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="如需断点续训，填入 *.pt 文件名（位于 checkpoints/ 目录下）",
+    )
+    p.add_argument(
+        "--from_checkpoint",
+        type=str,
+        default="",
+        help="从权重预加载",
     )
     p.add_argument(
         "--swanlab_id",
