@@ -496,7 +496,11 @@ class Encoder(nn.Module):
         """
         super().__init__()
         self.self_attn = RoPEMultiheadAttention(
-            embed_dim=args.dim, num_heads=args.n_heads, dropout=0.0
+            embed_dim=args.dim,
+            num_heads=args.n_heads,
+            dropout=0.0,
+            use_headwise_gate=args.use_headwise_gate,
+            use_elementwise_gate=args.use_elementwise_gate,
         )
         self.ffn = (
             MLP(args.dim, args.inter_dim)
