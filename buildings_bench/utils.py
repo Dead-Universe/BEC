@@ -33,9 +33,12 @@ def save_model_checkpoint(model, optimizer, scheduler, step, best_val_loss, path
 def load_model_checkpoint(path, model, optimizer, scheduler, local_rank):
     """Load model checkpoint."""
     checkpoint = torch.load(path, map_location=f"cuda:{local_rank}")
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler.load_state_dict(checkpoint["scheduler"])
+    model.load_state_dict(checkpoint["model"], strict=False)
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    except:
+        pass
     step = checkpoint["step"]
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
     # print(f"Loaded model checkpoint from {path}")
